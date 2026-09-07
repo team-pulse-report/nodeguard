@@ -1,0 +1,228 @@
+name: ci
+
+# The gates here are CONTRIBUTING.md's "Verification before claiming done" list,
+# not a generic pipeline: bash -n and shellcheck on every script, py_compile on
+# every Python file, the unittest suite, build/build.sh in a privileged Fedora
+# container, and openspec --strict. build.sh already runs the unit tests and the
+# Zabbix template drift gate as its own first steps, so they are not repeated
+# here; shellcheck and openspec are not in build.sh, which is why they are jobs.
+#
+# SECURITY, read before adding a trigger or a job.
+#
+# This repository is public and these runners are self-hosted, which GitHub
+# warns against combining for one reason: a workflow triggered by a fork's pull
+# request executes that fork's code on our hardware. The build job runs
+# build/build.sh in a --privileged container, nested inside a privileged dind
+# sidecar, on a k3s node that is also an etcd member. Arbitrary code there is
+# root on a builder, not a sandbox. Every job therefore carries the
+# `same-repo only` condition below, which refuses any pull request whose head
+# is not a branch of this repository. Do not remove it, do not add
+# pull_request_target (which is worse: it runs with our token), and set the
+# organization's Actions setting for fork pull requests to "Require approval
+# for all external contributors" as defence in depth rather than instead of it.
+#
+# Everything external is pinned by immutable digest or commit SHA: a tag can be
+# moved under us, a digest cannot. The cost is that these pins go stale and must
+# be bumped deliberately; that is the intended trade, not an oversight.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Four runners serve this organization, so a superseded pull request run is
+# capacity someone else is waiting on. Never cancel main: its build is the
+# provenance record for what was pushed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Read-only, and no job needs more. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # fedora:44 and node:22-alpine, resolved 2026-09-07. Pinned by digest so the
+  # toolchain cannot change under a rebuild; bump deliberately.
+  FEDORA_IMAGE: fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+  NODE_IMAGE: node@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32
+
+jobs:
+  # The three jobs are independent and run concurrently: the scale set allows
+  # four runners and they test different things, so serialising them would only
+  # add the slowest job's queue time to the total. Each pays its own package
+  # install; that is the price of not depending on the runner image's contents.
+  static:
+    name: static checks
+    # same-repo only: see the security note at the top of this file.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, builder]
+    timeout-minutes: 15
+    steps:
+      - name: Refuse to run anywhere but our own runners
+        run: |
+          test "${RUNNER_ENVIRONMENT:-}" = "self-hosted" \
+            || { echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset}, expected self-hosted"; exit 1; }
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # The workspace is bind-mounted into containers below. Leaving the
+          # credential in .git/config would hand it to anything running there.
+          persist-credentials: false
+
+      # Run the checks inside Fedora rather than on the runner image so the
+      # shellcheck and python versions match the hosts these scripts run on,
+      # and so this job does not silently depend on what the runner image
+      # happens to ship.
+      - name: bash -n, shellcheck, py_compile
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$FEDORA_IMAGE" bash -euo pipefail -c '
+            # Quiet on success, loud on failure: dnf writes its progress to
+            # stderr, which otherwise buries the check output this job exists
+            # to show. A failed install must not read as a passing job.
+            dnf -q install -y ShellCheck python3 git >/tmp/dnf.log 2>&1 \
+              || { echo "toolchain install failed"; cat /tmp/dnf.log; exit 1; }
+
+            # git ls-files, not find: only tracked files are checked, so an
+            # untracked scratch script or an editor artifact in the workspace
+            # can neither fail the build nor sneak past it. The container runs
+            # as root over a bind mount owned by another uid, which git refuses
+            # to read without this.
+            git config --global --add safe.directory /work
+
+            # Detect by shebang and by extension, then merge: bin/ executables
+            # carry no extension, and bin/nodeguard-lib.sh is sourced so it has
+            # a shellcheck directive instead of a shebang. A hardcoded list here
+            # would rot the first time a script is added.
+            {
+              git ls-files -- bin build deploy | while read -r f; do
+                # An if, not a && list: under set -e a non-matching shebang
+                # would otherwise abort the whole job on the first plain file.
+                if head -1 "$f" | grep -qE "^#!.*(bash|/sh)$"; then printf "%s\n" "$f"; fi
+              done
+              git ls-files -- "*.sh"
+            } | sort -u > /tmp/sh.txt
+
+            {
+              git ls-files -- bin build zbx tests | while read -r f; do
+                if head -1 "$f" | grep -qE "^#!.*python3$"; then printf "%s\n" "$f"; fi
+              done
+              git ls-files -- "*.py"
+            } | sort -u > /tmp/py.txt
+
+            echo "== shell scripts =="; cat /tmp/sh.txt
+            echo "== python files =="; cat /tmp/py.txt
+
+            # Guard against the checks passing because they found nothing. A
+            # zero-file run and a clean run look identical from the outside.
+            test -s /tmp/sh.txt || { echo "no shell scripts found; detection is broken"; exit 1; }
+            test -s /tmp/py.txt || { echo "no python files found; detection is broken"; exit 1; }
+
+            echo "== bash -n =="
+            xargs -r -a /tmp/sh.txt -n1 bash -n
+
+            echo "== shellcheck =="
+            xargs -r -a /tmp/sh.txt shellcheck -S warning
+
+            echo "== py_compile =="
+            xargs -r -a /tmp/py.txt python3 -m py_compile
+
+            echo "all static checks passed"
+          '
+
+  specs:
+    name: openspec
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, builder]
+    timeout-minutes: 15
+    steps:
+      - name: Refuse to run anywhere but our own runners
+        run: |
+          test "${RUNNER_ENVIRONMENT:-}" = "self-hosted" \
+            || { echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset}, expected self-hosted"; exit 1; }
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      # Version-pinned: an openspec that silently changes its strictness would
+      # change what this gate means without anything in this repository moving.
+      - name: openspec validate --all --strict
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$NODE_IMAGE" \
+            npx --yes @fission-ai/openspec@1.12.0 validate --all --strict
+
+  build:
+    name: build and rehearse
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, builder]
+    timeout-minutes: 45
+    steps:
+      - name: Refuse to run anywhere but our own runners
+        run: |
+          test "${RUNNER_ENVIRONMENT:-}" = "self-hosted" \
+            || { echo "RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-unset}, expected self-hosted"; exit 1; }
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # build.sh records the commit in the buildinfo sidecar, so it needs
+          # real git metadata rather than an exported tree.
+          fetch-depth: 1
+          # This workspace is mounted into a privileged container below.
+          persist-credentials: false
+
+      - name: build.sh in a privileged Fedora container
+        run: |
+          set -euo pipefail
+          echo "base image: $FEDORA_IMAGE"
+          # --privileged is required, not defensive: build.sh creates a network
+          # namespace and attaches the XDP object to rehearse the production
+          # pin/attach sequence. This container is itself nested inside the
+          # runner's dind sidecar, which is why that sidecar runs privileged.
+          # IMAGE_DIGEST is the same pinned reference, so the buildinfo sidecar
+          # records what actually compiled the object instead of "unknown".
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -e IMAGE_DIGEST="$FEDORA_IMAGE" \
+            "$FEDORA_IMAGE" /bin/bash /work/build/build.sh
+
+      - name: Summarise the build
+        if: always()
+        run: |
+          {
+            echo "### nodeguard build"
+            echo
+            if [ -f build/out/nodeguard_kern.o.sha256 ]; then
+              echo '```'
+              cat build/out/nodeguard_kern.o.sha256
+              echo '```'
+              echo
+              echo '<details><summary>buildinfo</summary>'
+              echo
+              echo '```'
+              cat build/out/nodeguard_kern.o.buildinfo 2>/dev/null || echo "(no buildinfo written)"
+              echo '```'
+              echo
+              echo '</details>'
+            else
+              echo "No object produced; the build did not reach the compile stage."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the object, spec, and provenance
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nodeguard-build-${{ github.sha }}
+          path: |
+            build/out/nodeguard_kern.o
+            build/out/nodeguard_kern.o.sha256
+            build/out/nodeguard_kern.o.buildinfo
+            build/out/nodeguard-maps.spec
+          if-no-files-found: error
+          retention-days: 30
