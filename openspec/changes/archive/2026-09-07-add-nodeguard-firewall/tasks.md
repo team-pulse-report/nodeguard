@@ -85,5 +85,5 @@
       are all feed-driven. The anti-spoofing gate has therefore never been
       exercised in production on either host, so a further six days of dry run
       would have produced the same empty result.
-- [ ] 6.3 `openspec validate add-nodeguard-firewall --strict` and archive
+- [x] 6.3 `openspec validate add-nodeguard-firewall --strict` and archive
       the change
