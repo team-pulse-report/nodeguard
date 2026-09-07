@@ -292,7 +292,28 @@ if [ -f /etc/zabbix_agentd.conf ] && \
     echo 'Include=/etc/zabbix_agentd.d/*.conf' >> /etc/zabbix_agentd.conf
 fi
 # NOTE: agent restart is a deliberate runbook step, not automated here.
+
+# SAFETY: /run/nodeguard must carry zabbix_var_run_t, not the var_run_t that
+# systemd-tmpfiles gives it by default. The Zabbix agent reads the kv files
+# from here as zabbix_agent_t, and that domain cannot read var_run_t: DAC
+# permits the read (the files are 0644) while SELinux refuses it, so the
+# UserParameter returns empty, the master item goes empty, and every one of
+# the 92 dependent items goes UNSUPPORTED at once. Observed exactly that on a
+# live host on 2026-09-07 when the kv files moved here out of the
+# zabbix-owned /run/zabbix.
+#
+# Testing this with `sudo zabbix_agentd -t` does NOT catch it: that runs as
+# root, outside the agent's domain, and passes while the running agent is
+# being denied. Check the item state in Zabbix, or ausearch for the AVC.
+#
+# The fcontext rule is what survives a reboot; the tmpfiles line only creates
+# the directory, and takes its label from policy.
+semanage fcontext -a -t zabbix_var_run_t "/run/nodeguard(/.*)?" 2>/dev/null \
+    || semanage fcontext -m -t zabbix_var_run_t "/run/nodeguard(/.*)?" 2>/dev/null \
+    || echo "WARNING: could not set the SELinux fcontext for /run/nodeguard;" \
+            "the Zabbix agent will read empty values until this is fixed"
 systemd-tmpfiles --create /etc/tmpfiles.d/nodeguard.conf
+restorecon -R /run/nodeguard 2>/dev/null || true
 
 install -m 0644 "$S/sysconfig-suricata" /etc/sysconfig/suricata
 install -m 0640 -o suricata -g suricata "$S/suricata.yaml" /etc/suricata/suricata.yaml
