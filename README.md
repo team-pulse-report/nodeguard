@@ -109,7 +109,9 @@ template are generated from `zbx/` (OpenSpec change
 `add-nodeguard-telemetry`, shipped and archived 2026-09-06) and address
 hosts through a Zabbix host group, so adding a gateway is: install
 nodeguard, link the template, add the host to the group; no widget rework.
-`docs/legend.html` explains every panel.
+Every panel is explained by the `nodeguard-*` sections of the
+`zabbix-dashboard-notes` ConfigMap in `homelab-gitops`, which the frontend
+serves same-origin and the dashboards link to by anchor.
 
 ## The 2am commands
 

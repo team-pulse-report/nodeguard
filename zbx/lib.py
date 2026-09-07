@@ -290,6 +290,9 @@ def honeycomb(x, y, w, h, name, groupid, item_pattern, thresholds=()):
 
 def url_widget(x, y, w, h, name, url):
     """Legend URL widget. The Zabbix URL widget refuses data: URIs, so the
-    legend is served from the public repository's GitHub Pages, which
-    sends no frame-blocking headers."""
+    text cannot be inlined here; it is served same-origin by the frontend
+    from the zabbix-dashboard-notes ConfigMap instead. Same-origin also
+    avoids depending on a third party sending no frame-blocking headers.
+    The iframe carries sandbox="" (no allow-scripts), so that page must
+    work without JavaScript."""
     return widget("url", x, y, w, h, name, [_f(FIELD_STR, "url", url)])

@@ -5,7 +5,8 @@
 Contract:
 - Builds "NodeGuard Overview", "NodeGuard Security", and "NodeGuard
   Capacity and Pipeline". Each answers one 2am question and carries a
-  legend URL widget pointing at the public legend page's matching anchor.
+  legend URL widget pointing at the matching anchor of the notes page the
+  Zabbix frontend serves from its own origin.
 - Fleet scaling: the host group (--group, default "Nodeguard nodes") is
   the canonical fleet definition, resolved live at run time. Item value
   tiles and gauges are generated per resolved group member; svggraph and
@@ -41,7 +42,14 @@ DASH_SECURITY = "NodeGuard Security"
 DASH_CAPACITY = "NodeGuard Capacity and Pipeline"
 LEGACY_DASH = "Nodeguard"
 DEFAULT_GROUP = "Nodeguard nodes"
-DEFAULT_LEGEND = "https://jesse-quinn.github.io/nodeguard/legend.html"
+# Same-origin path, not a public URL. The page is the zabbix-dashboard-notes
+# ConfigMap in homelab-gitops, mounted as a directory at
+# /usr/share/zabbix/notes/ and served by the frontend nginx; its text is
+# versioned there alongside the Builders and Gateways sections rather than
+# fetched from a third party that can move, rename, or vanish. It did exactly
+# that: this pointed at a GitHub Pages asset until the repository moved
+# organization on 2026-09-07 and every legend widget broke at once.
+DEFAULT_LEGEND = "/notes/dashboard-notes.html"
 
 PASS_PATH_ITEMS = [
     "nodeguard XDP pass rate",
@@ -183,7 +191,7 @@ def build_overview(ctx):
     refs = lib.RefSeq("OV")
     widgets = [lib.url_widget(0, 0, 72, 3,
                               "Legend: how to read this dashboard",
-                              ctx.legend_url + "#overview")]
+                              ctx.legend_url + "#nodeguard-overview")]
     y = 3
     tiles = [(12, "firewall attached?", "attach_state"),
              (12, "kill switch (0=enforcing)", "killswitch"),
@@ -233,7 +241,7 @@ def build_security(ctx):
     refs = lib.RefSeq("SE")
     widgets = [lib.url_widget(0, 0, 72, 3,
                               "Legend: how to read this dashboard",
-                              ctx.legend_url + "#security")]
+                              ctx.legend_url + "#nodeguard-security")]
     y = 3
     widgets.append(lib.svggraph(
         0, y, 36, 7,
@@ -282,7 +290,7 @@ def build_capacity(ctx):
     refs = lib.RefSeq("CA")
     widgets = [lib.url_widget(0, 0, 72, 3,
                               "Legend: how to read this dashboard",
-                              ctx.legend_url + "#capacity")]
+                              ctx.legend_url + "#nodeguard-capacity")]
     y = 3
     gauges = []
     for h in ctx.hosts:
@@ -422,8 +430,8 @@ def main():
                          "name); repeatable; default: the group's "
                          "resolved member visible names")
     ap.add_argument("--legend-url", default=DEFAULT_LEGEND,
-                    help="base URL of the legend page (default: the "
-                         "public GitHub Pages asset)")
+                    help="base URL of the notes page (default: the "
+                         "same-origin page the frontend serves)")
     ap.add_argument("--attack-map-url", default="",
                     help="URL serving the live attack-origin SVG "
                          "(nodeguard-geo writes it per host; the private "
