@@ -31,9 +31,9 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Four runners serve this organization, so a superseded pull request run is
-# capacity someone else is waiting on. Never cancel main: its build is the
-# provenance record for what was pushed.
+# Eight runners serve this organization and one full run needs three of them,
+# so a superseded pull request run is capacity a concurrent run is waiting on.
+# Never cancel main: its build is the provenance record for what was pushed.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -54,9 +54,11 @@ env:
 
 jobs:
   # The three jobs are independent and run concurrently: the scale set allows
-  # four runners and they test different things, so serialising them would only
-  # add the slowest job's queue time to the total. Each pays its own package
-  # install; that is the price of not depending on the runner image's contents.
+  # eight runners and they test different things, so serialising them would only
+  # add the slowest job's queue time to the total. Three of eight also leaves
+  # room for two more runs in flight, which is the case that actually queues.
+  # Each pays its own package install; that is the price of not depending on the
+  # runner image's contents.
   static:
     name: static checks
     # same-repo only: see the security note at the top of this file.
