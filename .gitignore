@@ -2,3 +2,8 @@ build/out/
 __pycache__/
 *.pyc
 hosts/*/suricata.yaml
+
+# Generated dashboard and report exports. The retired legacy dashboard was
+# tracked here and carried real hostnames into a public tree; regenerate from
+# zbx/ instead of committing an export.
+output/
