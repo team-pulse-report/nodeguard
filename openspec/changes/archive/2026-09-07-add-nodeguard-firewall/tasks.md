@@ -76,6 +76,14 @@
 ## 6. Phase 4: enforcement
 
 - [x] 6.1 Flip `ENFORCE=yes` on the internet gateway; monitor
-- [ ] 6.2 Enable on the remote node only after a week of clean operation
-- [ ] 6.3 `openspec validate add-nodeguard-firewall --strict` and archive
+- [x] 6.2 Enable on the remote node only after a week of clean operation
+      Done 2026-09-07 at operator request, one day into the week rather than
+      after it. Recorded rather than quietly ticked: the soak this task encodes
+      was measuring nothing. Across 19,520 alerts on the gateway and 86,277 on
+      the remote node, the responder has issued zero blocks and recorded zero
+      would-blocks, and both journals are empty; the 19,252 drops on the gateway
+      are all feed-driven. The anti-spoofing gate has therefore never been
+      exercised in production on either host, so a further six days of dry run
+      would have produced the same empty result.
+- [x] 6.3 `openspec validate add-nodeguard-firewall --strict` and archive
       the change
