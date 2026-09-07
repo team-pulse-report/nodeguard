@@ -157,7 +157,7 @@ External interfaces:
   key layout exists in exactly one implementation (`bin/ngmap.py:2`).
 - **The compiled object is the single source of map truth.** The build
   extracts `nodeguard-maps.spec` from the loaded object's BTF
-  (`build/build.sh:23`); the maps service creates or verifies pins only
+  (`build/build.sh:29`); the maps service creates or verifies pins only
   from that spec and refuses drift loudly (ADR 0004).
 - **TTLs are enforced in the kernel** by comparing a stored absolute
   `CLOCK_MONOTONIC` expiry against `bpf_ktime_get_ns()` per packet
@@ -271,10 +271,11 @@ sysconfig, resource-cap drop-in, device dependency drop-in, and
 
 ### `build/` and `deploy/`
 
-`build/build.sh` compiles with clang in a privileged container,
-generates the spec from the loaded object, rehearses the exact
-production pin/create/attach/verify/unload sequence in a netns
-(`build/build.sh:101`), exercises the encoders against live maps, and
+`build/build.sh` runs the stdlib unit suite in `tests/` as its first
+gate (`build/build.sh:19`), compiles with clang in a privileged
+container, generates the spec from the loaded object, rehearses the
+exact production pin/create/attach/verify/unload sequence in a netns
+(`build/build.sh:107`), exercises the encoders against live maps, and
 renders per-host `suricata.yaml` files via `build/mkyaml.py` from
 `build/suricata-stock.yaml` (kept for drift comparison against RPM
 updates). `deploy/deploy.sh` pushes the artifact set to one host,
@@ -532,7 +533,7 @@ ever modified:
 The map declarations in `src/nodeguard_kern.c` are normative. The build
 loads the object and extracts type, key size, value size,
 `max_entries`, and flags for all seven maps into `nodeguard-maps.spec`
-(`build/build.sh:23`), so the object and the maps service share one
+(`build/build.sh:29`), so the object and the maps service share one
 source of truth by construction. At every start, `ngmap.py create-maps`
 creates missing pins from the spec and verifies existing ones; any
 mismatch fails loudly with recovery instructions and blocks attach by
@@ -757,7 +758,9 @@ One bullet per ADR; the rationale and evidence live in the ADRs under
   pin-reuse mismatch, because the netns rehearsal runs the exact
   production sequence: spec-driven pin creation, dispatcher attach
   against the pins, map-identity check, encoder round-trips
-  (block/list/config/sweep), unload by id (`build/build.sh:101`).
+  (block/list/config/sweep), unload by id (`build/build.sh:107`). The
+  stdlib unit suite runs first (`build/build.sh:19`), so a control-plane
+  regression fails the build before any compile or rehearsal time.
 - **Deploy-time verification**: `bash -n` on every script,
   `py_compile` on the Python, `systemd-analyze verify` on every unit,
   and a sha256 of the installed object (`deploy/deploy.sh`).

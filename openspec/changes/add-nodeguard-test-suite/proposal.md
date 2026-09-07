@@ -75,7 +75,9 @@ have caught, two of which this change fixes test-first:
   (behavior-preserving extraction of the per-event pipeline);
   bin/nodeguard-watchdog (env-overridable state paths in the ANOMPY
   heredoc, defaults unchanged); build/build.sh (unit-test gate);
-  CONTRIBUTING.md (verification list).
+  CONTRIBUTING.md (verification list); README.md, docs/code-map.md, and
+  docs/design.md (the new tree and the new build gate recorded, and the
+  build/build.sh line citations the gate shifted).
 - Rollout: deploying the fixed bin/ scripts to devops-hive-node-2 and
   devops-hive-node-3 is a human follow-up via deploy/deploy.sh after
   this change is implemented and validated; it is deliberately not a

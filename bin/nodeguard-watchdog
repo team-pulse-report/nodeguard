@@ -24,9 +24,16 @@ if [ "${WD_ANOM_MODE:-shadow}" != "off" ] && [ -f /run/zabbix/nodeguard.kv ]; th
     WD_ANOM_MODE="${WD_ANOM_MODE:-shadow}"     WD_ANOM_K="${WD_ANOM_K:-8}" WD_ANOM_FLOOR="${WD_ANOM_FLOOR:-500}"     WD_ANOM_TRIP="${WD_ANOM_TRIP:-3}" WD_ANOM_ADAPT="${WD_ANOM_ADAPT:-30}"     python3 - <<'ANOMPY' | while read -r line; do ng_log "$line" crit; done
 import json, os, time
 
-KV = "/run/zabbix/nodeguard.kv"
-STATE = "/var/lib/nodeguard/wd_baseline.json"
-OUT = "/var/lib/nodeguard/wd_anomaly.kv"
+# The three state paths are overridable so the detector can be driven
+# against a temporary directory by the unit suite; the bash wrapper sets
+# none of them, so production reads and writes exactly these defaults.
+# They are a unit-test seam only: the wrapper's kv writer and its own
+# existence guard above still name /run/zabbix/nodeguard.kv literally, so
+# setting WD_ANOM_KV outside the suite moves what the detector reads
+# without moving what gates or produces it, and is not supported.
+KV = os.environ.get("WD_ANOM_KV", "/run/zabbix/nodeguard.kv")
+STATE = os.environ.get("WD_ANOM_STATE", "/var/lib/nodeguard/wd_baseline.json")
+OUT = os.environ.get("WD_ANOM_OUT", "/var/lib/nodeguard/wd_anomaly.kv")
 MODE = os.environ["WD_ANOM_MODE"]
 K = float(os.environ["WD_ANOM_K"])
 FLOOR = float(os.environ["WD_ANOM_FLOOR"])

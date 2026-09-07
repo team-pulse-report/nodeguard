@@ -34,6 +34,7 @@ bin/                        ngmap.py (all map encoding), CLIs, daemons
 units/                      systemd units and timers
 etc/                        shared config (protected.conf, sids.conf)
 hosts/example-gateway/      template per-host config (documentation IPs)
+tests/                      stdlib unit suite (no root, network, or bpftool)
 build/build.sh              container build + netns rehearsal + spec + yaml
 build/suricata-stock.yaml   stock 8.0.6 yaml kept for drift comparison
 deploy/deploy.sh            file push + verify; enables nothing

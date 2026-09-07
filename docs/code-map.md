@@ -164,13 +164,27 @@ Plan by default; --confirm applies.
 ## Build and deploy
 
 ### build/build.sh
-Runs in a Fedora container on a builder: compiles the object, generates
-the map spec FROM the object (never a hardcoded list), and rehearses the
-whole pin/attach/mutate sequence in a netns including crafted sanity
-packets, a read-failure drill, and a rollback. No compiler ever touches a
-gateway.
+Runs in a Fedora container on a builder: runs the `tests/` unit suite as
+its first gate (the cheapest one, so a broken control plane never spends
+compile or rehearsal time), compiles the object, generates the map spec
+FROM the object (never a hardcoded list), and rehearses the whole
+pin/attach/mutate sequence in a netns including crafted sanity packets, a
+read-failure drill, and a rollback. No compiler ever touches a gateway.
 
 ### deploy/deploy.sh
 Pushes the artifact set to one host and verifies it, starting nothing.
 `--with-kernel` is required to move the datapath object, so a routine
 userspace deploy can never activate an untested kernel program.
+
+## Tests
+
+### tests/
+The stdlib unittest suite over the userspace control plane: `ngtest.py`
+(the harness: importlib loader for the extensionless `bin/` scripts, the
+extractor for the watchdog's embedded detector, and the fakes for every
+subprocess and transport boundary) plus `test_ngmap.py`,
+`test_feeds.py`, `test_responder.py`, and `test_watchdog_anom.py`.
+Hermetic by invariant: no root, no network, no bpftool, and no write
+outside a temporary directory, so it runs on any machine with python3.
+`deploy.sh` ships an explicit manifest, so the suite never reaches a
+gateway.

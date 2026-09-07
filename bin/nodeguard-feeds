@@ -182,13 +182,24 @@ def parse_spamhaus(body):
             continue
         if "cidr" not in obj:
             raise ValueError(f"line {i + 1}: cidr-less record")
+        if not isinstance(obj["cidr"], str):
+            # SAFETY: ip_network() accepts a JSON integer or boolean as a
+            # packed address and would yield a bogus /32 (123 becomes
+            # 0.0.0.123/32); upstream sends strings, so anything else is
+            # a validation failure of the whole feed.
+            raise ValueError(f"line {i + 1}: cidr is not a string")
         net = ipaddress.ip_network(obj["cidr"], strict=True)
         records.append((net, str(obj.get("sblid", ""))))
     if trailer is None:
         raise ValueError("missing metadata trailer")
-    if int(trailer.get("records", -1)) != len(records):
-        raise ValueError(
-            f"trailer records={trailer.get('records')} != {len(records)}")
+    count = trailer.get("records")
+    # bool is an int subclass, and a list, dict, or null here used to
+    # reach int() and raise TypeError, an exception class the per-feed
+    # handler did not contain.
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise ValueError(f"trailer records={count!r} is not an integer")
+    if count != len(records):
+        raise ValueError(f"trailer records={count} != {len(records)}")
     return records, {"copyright": trailer.get("copyright", ""),
                      "timestamp": trailer.get("timestamp", "")}
 
@@ -292,6 +303,9 @@ class Runner:
         self.candidates = 0
         self.churn_held = []
         self.map_errors = 0
+        # Map mutations this run has performed. A crash before the first
+        # one wrote nothing, so crash-adoption must not arm for it.
+        self.writes = 0
         self.accepted = set()  # feeds whose churn a human just confirmed
         self.boot = boot_id()
         self.prev_boot = self.state.get("boot_id")
@@ -356,9 +370,14 @@ class Runner:
 
         try:
             records, attribution = PARSERS[d["kind"]](body)
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        except Exception as e:
+            # SAFETY: the parser is body-driven code, so a remote party
+            # must not get to pick an exception class that escapes this
+            # handler and kills the whole run. GateAbort is a SystemExit
+            # and still propagates; every other surprise costs one feed.
             self.failed.append(feed)
-            self.dline(f"FAILED {feed}: validation: {e}")
+            self.dline(f"FAILED {feed}: validation: "
+                       f"{e.__class__.__name__}: {e}")
             with open(f"{STATE_DIR}/{feed}/last-bad", "wb") as f:
                 f.write(body)
             return None
@@ -580,6 +599,7 @@ class Runner:
                     if cur_exp == row["written_expiry_ns"]:
                         ngmap.update_map(path, keyb,
                                          encode_value(expiry, cur_hits))
+                        self.writes += 1
                         row.update(written_expiry_ns=expiry,
                                    last_written=self.now, ref=ref)
                         counts["refresh"] += 1
@@ -590,6 +610,7 @@ class Runner:
                     return
                 if row is not None and cur is None:
                     ngmap.update_map(path, keyb, encode_value(expiry, 0))
+                    self.writes += 1
                     row.update(written_expiry_ns=expiry,
                                last_written=self.now, ref=ref)
                     counts["insert"] += 1
@@ -598,6 +619,7 @@ class Runner:
                     return
                 if cur is None:
                     ngmap.update_map(path, keyb, encode_value(expiry, 0))
+                    self.writes += 1
                     entries[k] = {"feed": feed, "ref": ref,
                                   "written_expiry_ns": expiry,
                                   "first_seen": self.now,
@@ -608,6 +630,7 @@ class Runner:
                 if cur_exp and ngmap.mono_ns() >= cur_exp:
                     # expired corpse enforces nothing for anyone: adopt
                     ngmap.update_map(path, keyb, encode_value(expiry, 0))
+                    self.writes += 1
                     entries[k] = {"feed": feed, "ref": ref,
                                   "written_expiry_ns": expiry,
                                   "first_seen": self.now,
@@ -620,6 +643,7 @@ class Runner:
                     # this loader never writes 0; never adopt those.
                     ngmap.update_map(path, keyb,
                                      encode_value(expiry, cur_hits))
+                    self.writes += 1
                     entries[k] = {"feed": feed, "ref": ref,
                                   "written_expiry_ns": expiry,
                                   "first_seen": self.now,
@@ -649,6 +673,7 @@ class Runner:
                     cur_exp, _ = decode_value(cur)
                     if cur_exp == row["written_expiry_ns"]:
                         ngmap.delete_key(path, keyb)
+                        self.writes += 1
                         counts["withdraw"] += 1
                 del entries[k]
             finally:
@@ -689,6 +714,20 @@ class Runner:
             save_json(STATE, self.state)
             self.finish(feeds)
             return 1
+        except Exception as e:
+            # SAFETY: an unexpected crash must not arm crash-adoption on
+            # a run that wrote nothing, or remote content could arm it by
+            # provoking a crash. After a write, the marker stays set:
+            # bounded adoption is the designed recovery for exactly that
+            # case, and this handler must not weaken it.
+            log(f"feeds: run FAILED with an unexpected {e.__class__.__name__}"
+                f": {e}")
+            self.failed = sorted(set(self.failed) | set(feeds))
+            if self.writes == 0:
+                self.state["run_in_progress"] = False
+                save_json(STATE, self.state)
+            self.finish(feeds)
+            raise
 
     def _run_inner(self, feeds, allow):
         """The core fetch, gate, and per-feed reconcile pass, run once the pre-write allow-map guard has passed."""

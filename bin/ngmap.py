@@ -28,6 +28,13 @@ import time
 PIN = "/sys/fs/bpf/nodeguard"
 BPFTOOL = "/usr/sbin/bpftool"
 
+# INVARIANT: the widths of the packed map encodings above ("<I" keys,
+# "<Q" values). Every operator-supplied integer is range-checked against
+# these before any encode, so a mistyped argument reaches die() instead
+# of struct.pack.
+U32_MAX = 2 ** 32 - 1
+U64_MAX = 2 ** 64 - 1
+
 STAT_NAMES = [
     "pass", "drop_v4", "drop_v6", "pass_expired",
     "pass_allowlist", "pass_wgport", "pass_nonip", "pass_parsefail",
@@ -253,6 +260,9 @@ def cmd_block(a):
     if reason:
         die(f"refusing to block {net}: {reason}")
     expiry = 0 if a.permanent else mono_ns() + a.ttl * 10**9
+    if expiry > U64_MAX:
+        die(f"--ttl {a.ttl} puts the expiry past the 64-bit map value; "
+            f"the largest usable value is {(U64_MAX - mono_ns()) // 10**9}s")
     value = struct.pack("<QQ", expiry, 0)
     lock = block_lock()
     try:
@@ -451,7 +461,11 @@ def cmd_get_config(a):
 
 
 def cmd_set_config(a):
-    """Write one config-map slot, range-checking the WireGuard port in slot 0."""
+    """Write one config-map slot, range-checking the slot and value against their packed widths and the WireGuard port in slot 0."""
+    if not 0 <= a.slot <= U32_MAX:
+        die(f"slot {a.slot} out of range 0-{U32_MAX}")
+    if not 0 <= a.value <= U64_MAX:
+        die(f"value {a.value} out of range 0-{U64_MAX}")
     if a.slot == 0 and not (1 <= a.value <= 65535):
         die(f"wg_port {a.value} out of range 1-65535")
     update_map(f"{PIN}/config", struct.pack("<I", a.slot),
@@ -622,7 +636,10 @@ def main():
     a = p.parse_args()
     try:
         a.fn(a)
-    except RuntimeError as e:
+    except (RuntimeError, struct.error) as e:
+        # SAFETY: backstop for any pack site the per-command range checks
+        # do not cover; an operator mid-incident gets the one-line error
+        # every other failure prints, never a traceback.
         die(str(e))
 
 

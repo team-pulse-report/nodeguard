@@ -16,6 +16,12 @@ mkdir -p "$OUT"
 dnf -q install -y clang llvm libbpf-devel libxdp-devel xdp-tools bpftool \
     kernel-headers python3-pyyaml iproute >/dev/null
 
+echo "== unit tests =="
+# The cheapest gate in this file, and it needs nothing the container
+# installed except python3, so a broken tree spends no compile or
+# rehearsal time. set -e fails the build on the first failing test.
+python3 -m unittest discover -s "$REPO/tests" -v
+
 echo "== compile =="
 clang -O2 -g -Wall -Werror -target bpf -D__x86_64__ \
     -c "$REPO/src/nodeguard_kern.c" -o "$OUT/nodeguard_kern.o"

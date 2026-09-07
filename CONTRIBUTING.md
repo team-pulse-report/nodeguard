@@ -30,7 +30,8 @@ Rules:
 ## Style
 
 - Bash: `set -uo pipefail`, shellcheck-clean, quote expansions.
-- Python: stdlib only, py_compile-clean.
+- Python: stdlib only, py_compile-clean, and covered by the `tests/`
+  unittest suite (stdlib only as well: no root, no network, no bpftool).
 - No emojis; no em or en dashes in prose (semicolons, colons, commas,
   parentheses; ranges as "X to Y").
 - No AI attribution in commits. Imperative commit subjects, <= 72 chars.
@@ -38,6 +39,9 @@ Rules:
 ## Verification before claiming done
 
 `bash -n` and `shellcheck` on every script, `python3 -m py_compile` on
-every Python file, `build/build.sh` in a privileged Fedora 44 container
-(compiles, generates the map spec, and rehearses the pin/attach sequence
-in a netns), and `openspec validate --strict` for spec changes.
+every Python file, `python3 -m unittest discover -s tests` from the
+repository root (which needs only python3, and which `build/build.sh`
+runs as its first gate), `build/build.sh` in a privileged Fedora 44
+container (compiles, generates the map spec, and rehearses the
+pin/attach sequence in a netns), and `openspec validate --strict` for
+spec changes.
