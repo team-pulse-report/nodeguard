@@ -22,6 +22,19 @@ main branch.
   record build provenance"), and `close-nodeguard-alerting-gaps` ("Close
   alerting gaps with heartbeats, freshness stamps, triggers").
 
+### Pending verification
+
+- Everything under Unreleased was implemented and verified on a macOS
+  workstation: the unit suite, `bash -n`, `shellcheck`, `py_compile`, the
+  Zabbix template drift gate, and `openspec validate --strict`. The
+  container-only gates have NOT run: `build/build.sh`'s kernel compile, BTF
+  map-spec generation, and netns attach rehearsal, plus the live
+  `systemd-analyze verify`, `suricata -T`, and `rpm` behaviour a real
+  `deploy/deploy.sh` run exercises. Run `build/build.sh` on a Fedora 44
+  x86_64 build host and re-read one full trace before deploying any of this
+  to a gateway; the hardened units in particular change namespace and
+  capability behaviour that only a live host can prove.
+
 
 ### Added
 
