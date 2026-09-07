@@ -1,5 +1,7 @@
 # nodeguard
 
+![nodeguard: XDP/eBPF firewall with Suricata IPS wiring](docs/media/nodeguard-hero.png)
+
 An eBPF/XDP firewall with Suricata IPS wiring for small Linux gateways
 (Fedora 44, stock packages only). Suricata detects passively; a ~200-line
 custom XDP program blocks confirmed attackers at the driver, with in-kernel
