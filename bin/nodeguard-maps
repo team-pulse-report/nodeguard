@@ -5,7 +5,61 @@ set -uo pipefail
 . /usr/local/lib/nodeguard/nodeguard-lib.sh
 ng_env
 
-mkdir -p "$NG_RUN"
+# Persistent (NOT tmpfs): the last-good snapshots exist for boot-time
+# generation, which is exactly when resolution races the network.
+ALLOW_CACHE=/var/lib/nodeguard/allow-cache
+ALLOW_KV="$NG_RUN/allow.kv"
+FRESH="$NG_RUN/allow-fresh.txt"
+
+# Directive outcomes for the kv export below: gen_fail is 1 when any
+# dynamic directive could not be looked up this run or could not refresh
+# its snapshot; gen_stale counts the directives served from their
+# last-good snapshot.
+gen_fail=0
+gen_stale=0
+
+mkdir -p "$NG_RUN" "$ALLOW_CACHE"
+
+# A directive argument becomes a path element of the last-good cache, so
+# reduce it to characters a filename carries safely.
+cache_name() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# Fold one dynamic directive's fresh output into the generated allow file,
+# keeping a per-directive last-good snapshot.
+# SAFETY: reconcile-allow deletes every live allow entry the generated
+# file omits, so one transient DNS or DERP failure would evict a protected
+# remote from the live maps and make the management fallback path
+# blockable (DERP rides TCP/443, which the kernel's UDP-only WireGuard
+# pass does not cover). Serving the snapshot keeps the protection; an
+# allow entry can only pass traffic, never drop it.
+# NOTE: an empty result on a zero exit counts as a failure, since
+# replacing a good snapshot with nothing is the eviction this cache
+# exists to prevent.
+allow_cache_fold() {
+    local name="$1" fresh="$2" rc="$3"
+    local cache="$ALLOW_CACHE/$name.txt"
+    if [ "$rc" -eq 0 ] && [ -s "$fresh" ]; then
+        cat "$fresh" >> "$GEN"
+        # A full, read-only, or SELinux-denied /var/lib freezes the
+        # snapshot at whatever it last held, and the next directive
+        # failure would then serve arbitrarily old entries with nothing
+        # in the kv saying so. Degraded, therefore, not silent.
+        if ! { cp "$fresh" "$cache.tmp" && mv -f "$cache.tmp" "$cache"; }; then
+            gen_fail=1
+            ng_log "protected.conf: $name snapshot write failed; its last-good is now stale" warning
+        fi
+        return 0
+    fi
+    gen_fail=1
+    if [ -s "$cache" ]; then
+        cat "$cache" >> "$GEN"
+        gen_stale=$((gen_stale + 1))
+        ng_log "protected.conf: $name failed; using last-good ($(grep -c . "$cache") entries)" warning
+    else
+        ng_log "protected.conf: $name failed with no last-good snapshot; its entries are absent this run" warning
+    fi
+    return 1
+}
 
 # 1. Create missing maps / verify existing ones against the build-generated
 #    spec. A mismatch fails here, loudly, with recovery instructions.
@@ -31,8 +85,9 @@ if [ -f /etc/nodeguard/protected.conf ]; then
             ;;
         resolve)
             # Best effort snapshot of current A/AAAA records (the fleet
-            # resolver is Quad9). Failure is logged, never fatal.
-            python3 - "$arg" >> "$GEN" 2>/dev/null <<'PYEOF' || ng_log "protected.conf: resolve failed for $arg" warning
+            # resolver is Quad9). Failure falls back to the last-good
+            # snapshot, never to omitting the protection.
+            python3 - "$arg" > "$FRESH" 2>/dev/null <<'PYEOF'
 import socket, sys
 seen = set()
 for fam, _t, _p, _c, sa in socket.getaddrinfo(sys.argv[1], None):
@@ -41,11 +96,15 @@ for fam, _t, _p, _c, sa in socket.getaddrinfo(sys.argv[1], None):
         seen.add(ip)
         print(f"{ip}/32" if fam == socket.AF_INET else f"{ip}/128")
 PYEOF
+            rc=$?
+            allow_cache_fold "resolve_$(cache_name "$arg")" "$FRESH" "$rc"
             ;;
         derp)
             derpjson="$NG_RUN/derp-map.json"
+            : > "$FRESH"
+            rc=1
             if tailscale debug derp-map > "$derpjson" 2>/dev/null; then
-                python3 - "$derpjson" >> "$GEN" <<'PYEOF' || ng_log "protected.conf: derp-map parse failed" warning
+                python3 - "$derpjson" > "$FRESH" <<'PYEOF'
 import json, sys
 with open(sys.argv[1]) as f:
     data = json.load(f)
@@ -58,9 +117,11 @@ for region in data.get("Regions", {}).values():
                 seen.add(ip)
                 print(ip + suffix)
 PYEOF
+                rc=$?
             else
                 ng_log "protected.conf: derp-map fetch failed" warning
             fi
+            allow_cache_fold derp "$FRESH" "$rc"
             ;;
         *)
             ng_log "protected.conf: unknown directive '$directive'" warning
@@ -86,10 +147,25 @@ fi
 # 4. Reconcile allow maps to static files + generated entries.
 #    SAFETY: refuses to proceed if the canary target appears in any allow
 #    source (the watchdog's over-block probe must never be allowlisted).
-python3 "$NG_MAP" reconcile-allow \
+reconcile_out=$(python3 "$NG_MAP" reconcile-allow \
     --static /etc/nodeguard/allow4.txt /etc/nodeguard/allow6.txt \
     --generated "$GEN" \
-    --canary "${CANARY_IP:?CANARY_IP not set}" || exit 2
+    --canary "${CANARY_IP:?CANARY_IP not set}") || exit 2
+printf '%s\n' "$reconcile_out"
+
+# 4b. Allow-generation state for the monitoring chain, written into the
+# root-owned $NG_RUN rather than /run/zabbix, which the agent owns and a
+# root writer therefore must not create files in.
+# SAFETY: an entry count that could not be parsed is OMITTED, so its item
+# goes unsupported rather than reading as an empty allowlist.
+entries=$(printf '%s\n' "$reconcile_out" \
+    | awk '/allow maps reconciled/ { print $(NF - 1) }')
+{
+    [ -n "$entries" ] && echo "ng.allow_entries=$entries"
+    echo "ng.allow_gen_fail=$gen_fail"
+    echo "ng.allow_gen_stale=$gen_stale"
+    echo "ng.allow_reconcile_ts=$(date +%s)"
+} > "$ALLOW_KV.tmp" && mv -f "$ALLOW_KV.tmp" "$ALLOW_KV"
 
 # 5. Live WireGuard port into config[0]. Primary source is the socket
 #    tailscaled actually bound; last resort is the tailscale default.

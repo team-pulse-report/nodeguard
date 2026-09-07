@@ -191,6 +191,52 @@ def delete_key(path, key):
     return True
 
 
+def expired_entries(path):
+    """Networks in a block map whose nonzero expiry has already passed.
+    A bulk writer snapshots this once per run and hands the result to
+    purge_contained_expired, instead of dumping the map per insert."""
+    now = mono_ns()
+    out = []
+    for k, v in dump_map(path):
+        expiry, _ = struct.unpack("<QQ", v)
+        if expiry and now >= expiry:
+            out.append(decode_key(k))
+    return out
+
+
+def purge_contained_expired(path, net, candidates=None):
+    """Delete the expired entries strictly contained in a just-inserted
+    network, and return how many went. Callers hold block_lock across
+    their write and this call.
+    SAFETY: the kernel performs ONE LPM lookup per family
+    (src/nodeguard_kern.c handle_v4/handle_v6), so an expired
+    more-specific entry is the longest match for its own address inside a
+    live broader block and passes that address until the corpse is gone.
+    This is the fail-open direction, and the sweep remains the backstop;
+    a writer that now covers the corpse closes the window at insert time.
+    SAFETY: every candidate is re-looked-up here and deleted only while
+    still expired, the sweep's rule (leaving a corpse is harmless,
+    deleting a fresh block is not). Live entries, permanent entries
+    (expiry 0), and equal-length keys are never touched."""
+    if candidates is None:
+        candidates = expired_entries(path)
+    now = mono_ns()
+    purged = 0
+    for cand in candidates:
+        if cand.version != net.version or cand.prefixlen <= net.prefixlen:
+            continue
+        if not cand.subnet_of(net):
+            continue
+        key = key_bytes(cand)
+        cur = lookup_value(path, key)
+        if cur is None:
+            continue
+        expiry, _ = struct.unpack("<QQ", cur)
+        if expiry and now >= expiry and delete_key(path, key):
+            purged += 1
+    return purged
+
+
 def load_allow_files(files):
     """Read one or more allow-list text files (comments stripped) into a list of parsed networks."""
     nets = []
@@ -263,14 +309,46 @@ def cmd_block(a):
     if expiry > U64_MAX:
         die(f"--ttl {a.ttl} puts the expiry past the 64-bit map value; "
             f"the largest usable value is {(U64_MAX - mono_ns()) // 10**9}s")
-    value = struct.pack("<QQ", expiry, 0)
+    path = map_path(net, "block")
+    keyb = key_bytes(net)
+    purged = 0
     lock = block_lock()
     try:
-        update_map(map_path(net, "block"), key_bytes(net), value)
+        # SAFETY: lookup and write share one lock hold, so a concurrent
+        # sweep or feeds run cannot interleave between them. Reading first
+        # is what keeps a manual permanent entry from being demoted to a
+        # TTL block, and what carries a live entry's hit counter forward
+        # into the refresh so the sweep's delta leaderboard still ranks
+        # the re-offending source.
+        hits = 0
+        cur = lookup_value(path, keyb)
+        if cur is not None:
+            cur_expiry, cur_hits = struct.unpack("<QQ", cur)
+            # An expired entry enforces nothing for anyone, so it is
+            # treated as absent and the new block starts its own count.
+            if cur_expiry == 0 or mono_ns() < cur_expiry:
+                if cur_expiry == 0 and not a.i_mean_it:
+                    die(f"{net} already holds a PERMANENT block; refusing to "
+                        f"replace it with a {a.ttl}s TTL. Pass --i-mean-it to "
+                        "overwrite it deliberately, or nodeguard-unblock it "
+                        "first")
+                hits = cur_hits
+        update_map(path, keyb, struct.pack("<QQ", expiry, hits))
+        if net.prefixlen < net.max_prefixlen:
+            try:
+                purged = purge_contained_expired(path, net)
+            except RuntimeError as e:
+                # SAFETY: the block above is already written and
+                # enforcing; a failed corpse purge leaves the sweep as the
+                # backstop and must not turn a successful block into the
+                # nonzero exit the responder logs as "block FAILED".
+                print(f"ngmap: contained-expired purge failed: {e}",
+                      file=sys.stderr)
     finally:
         lock.close()
     print(f"blocked {net} "
-          + ("permanently" if a.permanent else f"for {a.ttl}s"))
+          + ("permanently" if a.permanent else f"for {a.ttl}s")
+          + (f"; purged {purged} contained expired entries" if purged else ""))
 
 
 def cmd_unblock(a):
@@ -572,6 +650,11 @@ def cmd_reconcile_allow(a):
             if kb not in want:
                 delete_key(path, kb)
                 removed += 1
+    # INVARIANT: this line's phrase and field order are parsed, not just
+    # read. Dependent: bin/nodeguard-maps' `awk '/allow maps reconciled/
+    # { print $(NF - 1) }'`, which sources ng.allow_entries from the
+    # second-to-last field. A reword drops the kv key (the key is omitted,
+    # so it reads unsupported rather than zero) with nothing failing.
     print(f"allow maps reconciled: {added} added/updated, {removed} removed, "
           f"{len(desired)} total")
 

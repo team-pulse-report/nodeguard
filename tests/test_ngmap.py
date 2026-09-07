@@ -17,6 +17,11 @@ ngmap = ngtest.load_bin("ngmap", "ngmap.py")
 V4_PREFIXES = (0, 8, 16, 24, 32)
 V6_PREFIXES = (0, 32, 48, 64, 128)
 U64_CEILING = 2 ** 64
+# A fixed CLOCK_MONOTONIC reading, so an expiry in a test is exactly as
+# far past or future as the test says.
+NOW_NS = 1_000_000_000
+TARGET = "203.0.113.7"
+COVERING = "203.0.113.0/24"
 
 
 def block_args(target, ttl=3600, permanent=False, i_mean_it=False):
@@ -146,6 +151,156 @@ class BlockCommandTest(unittest.TestCase):
             self.fake.updates,
             [(ngmap.map_path(net, "block"), ngmap.key_bytes(net),
               struct.pack("<QQ", 1_000_000_000 + 60 * 10 ** 9, 0))])
+
+
+class BlockValueTest(unittest.TestCase):
+    """Finding K1: cmd_block reads the existing value before writing, so a
+    manual permanent entry is never demoted by automation and a live
+    entry's hits survive the refresh."""
+
+    def setUp(self):
+        self.fake = ngtest.FakeMaps()
+        self.fake.install(self, ngmap)
+        ngtest.patch_attrs(self, ngmap, mono_ns=lambda: NOW_NS)
+        self.net = ipaddress.ip_network(f"{TARGET}/32")
+        self.path = ngmap.map_path(self.net, "block")
+
+    def seed(self, expiry, hits):
+        """Put one block entry in the fake map and forget the call, so a
+        later assertion sees only what cmd_block wrote."""
+        self.fake.update_map(self.path, ngmap.key_bytes(self.net),
+                             struct.pack("<QQ", expiry, hits))
+        self.fake.updates.clear()
+
+    def written(self):
+        """The (expiry, hits) cmd_block wrote for the fixture's target."""
+        self.assertEqual(len(self.fake.updates), 1, self.fake.updates)
+        path, key, value = self.fake.updates[0]
+        self.assertEqual((path, key), (self.path, ngmap.key_bytes(self.net)))
+        return struct.unpack("<QQ", value)
+
+    def test_absent_entry_is_written_fresh(self):
+        with ngtest.captured_log():
+            ngmap.cmd_block(block_args(TARGET, ttl=60))
+        self.assertEqual(self.written(), (NOW_NS + 60 * 10 ** 9, 0))
+
+    def test_permanent_entry_is_not_demoted_by_automation(self):
+        self.seed(expiry=0, hits=99)
+        with ngtest.captured_error() as err:
+            with self.assertRaises(SystemExit):
+                ngmap.cmd_block(block_args(TARGET, ttl=60))
+        self.assertIn("PERMANENT", err.getvalue())
+        self.assertIn("--i-mean-it", err.getvalue())
+        self.assertEqual(self.fake.updates, [])
+        self.assertEqual(
+            struct.unpack("<QQ", self.fake.lookup_value(
+                self.path, ngmap.key_bytes(self.net))), (0, 99))
+
+    def test_permanent_entry_is_overwritten_with_the_flag(self):
+        self.seed(expiry=0, hits=99)
+        with ngtest.captured_log():
+            ngmap.cmd_block(block_args(TARGET, ttl=60, i_mean_it=True))
+        self.assertEqual(self.written(), (NOW_NS + 60 * 10 ** 9, 99))
+
+    def test_live_entry_refresh_carries_hits_forward(self):
+        self.seed(expiry=NOW_NS + 10 ** 9, hits=4242)
+        with ngtest.captured_log():
+            ngmap.cmd_block(block_args(TARGET, ttl=60))
+        self.assertEqual(self.written(), (NOW_NS + 60 * 10 ** 9, 4242))
+
+    def test_expired_entry_is_treated_as_absent(self):
+        self.seed(expiry=NOW_NS - 1, hits=4242)
+        with ngtest.captured_log():
+            ngmap.cmd_block(block_args(TARGET, ttl=60))
+        self.assertEqual(self.written(), (NOW_NS + 60 * 10 ** 9, 0))
+
+
+class ContainedExpiredTest(unittest.TestCase):
+    """Finding K2: the kernel makes one LPM lookup, so an expired
+    more-specific entry passes its own address inside a live broader
+    block. A writer that covers the corpse deletes it."""
+
+    def setUp(self):
+        self.fake = ngtest.FakeMaps()
+        self.fake.install(self, ngmap)
+        ngtest.patch_attrs(self, ngmap, mono_ns=lambda: NOW_NS)
+        self.covering = ipaddress.ip_network(COVERING)
+        self.path = ngmap.map_path(self.covering, "block")
+
+    def put(self, cidr, expiry, hits=0):
+        """Add one block entry and return its network."""
+        net = ipaddress.ip_network(cidr)
+        self.fake.update_map(self.path, ngmap.key_bytes(net),
+                             struct.pack("<QQ", expiry, hits))
+        return net
+
+    def present(self, net):
+        """Whether the fake map still holds an entry for a network."""
+        return self.fake.lookup_value(
+            self.path, ngmap.key_bytes(net)) is not None
+
+    def test_expired_strict_subnet_is_deleted(self):
+        corpse = self.put(f"{TARGET}/32", NOW_NS - 1)
+        purged = ngmap.purge_contained_expired(self.path, self.covering)
+        self.assertEqual(purged, 1)
+        self.assertFalse(self.present(corpse))
+
+    def test_live_subnet_is_kept(self):
+        live = self.put(f"{TARGET}/32", NOW_NS + 10 ** 9)
+        self.assertEqual(
+            ngmap.purge_contained_expired(self.path, self.covering), 0)
+        self.assertTrue(self.present(live))
+
+    def test_permanent_subnet_is_kept(self):
+        permanent = self.put(f"{TARGET}/32", 0)
+        self.assertEqual(
+            ngmap.purge_contained_expired(self.path, self.covering), 0)
+        self.assertTrue(self.present(permanent))
+
+    def test_equal_length_key_is_untouched(self):
+        same = self.put(COVERING, NOW_NS - 1)
+        self.assertEqual(
+            ngmap.purge_contained_expired(self.path, self.covering), 0)
+        self.assertTrue(self.present(same))
+
+    def test_entry_outside_the_covering_network_is_untouched(self):
+        outside = self.put("198.51.100.7/32", NOW_NS - 1)
+        self.assertEqual(
+            ngmap.purge_contained_expired(self.path, self.covering), 0)
+        self.assertTrue(self.present(outside))
+
+    def test_candidate_revived_since_the_snapshot_is_kept(self):
+        # The bulk path snapshots corpses once per run; the under-lock
+        # re-verification is what authorizes each delete, so a key another
+        # writer re-blocked in between survives.
+        candidates = [self.put(f"{TARGET}/32", NOW_NS - 1)]
+        revived = self.put(f"{TARGET}/32", NOW_NS + 10 ** 9)
+        self.assertEqual(
+            ngmap.purge_contained_expired(self.path, self.covering,
+                                          candidates), 0)
+        self.assertTrue(self.present(revived))
+
+    def test_candidate_deleted_since_the_snapshot_is_tolerated(self):
+        candidates = [ipaddress.ip_network(f"{TARGET}/32")]
+        self.assertEqual(
+            ngmap.purge_contained_expired(self.path, self.covering,
+                                          candidates), 0)
+        self.assertEqual(self.fake.deletes, [])
+
+    def test_a_cidr_block_purges_its_contained_corpse(self):
+        corpse = self.put(f"{TARGET}/32", NOW_NS - 1)
+        with ngtest.captured_log() as out:
+            ngmap.cmd_block(block_args(COVERING))
+        self.assertFalse(self.present(corpse))
+        self.assertIn("purged 1 contained expired entries", out.getvalue())
+
+    def test_a_host_block_purges_nothing(self):
+        corpse = self.put(f"{TARGET}/32", NOW_NS - 1)
+        with ngtest.captured_log():
+            ngmap.cmd_block(block_args("203.0.113.9"))
+        # A host route cannot strictly contain anything, so the dump the
+        # purge would need never happens.
+        self.assertTrue(self.present(corpse))
 
 
 class IntegerRangeTest(unittest.TestCase):

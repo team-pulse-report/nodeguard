@@ -252,7 +252,11 @@ parameter drift; enum at `src/nodeguard_kern.c:62`, map at
 (`Restart=on-failure`), `nodeguard-sweep.timer` (10 min),
 `nodeguard-watchdog.timer` (1 min), `nodeguard-feeds.service` (oneshot)
 with `nodeguard-feeds.timer` (every 6 h, 15 min after boot, randomized
-delay; `units/nodeguard-feeds.timer:8`), and the `suricata-update`
+delay; `units/nodeguard-feeds.timer:8`),
+`nodeguard-allow-refresh.service` (oneshot; it reloads
+`nodeguard-maps.service`, the hitless verb, and never restarts it) with
+`nodeguard-allow-refresh.timer` (hourly, 15 min after boot, randomized
+delay; `units/nodeguard-allow-refresh.timer:6`), and the `suricata-update`
 service/timer pair (daily, with the systemd ignore-failure `-` prefix on
 the reload so a stopped Suricata never fails the update;
 `units/suricata-update.service:8`).

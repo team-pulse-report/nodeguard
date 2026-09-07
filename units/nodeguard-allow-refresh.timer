@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the nodeguard allow maps every hour
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

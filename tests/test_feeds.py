@@ -16,6 +16,7 @@ ngmap = ngtest.load_bin("ngmap", "ngmap.py")
 feeds = ngtest.load_bin("nodeguard_feeds", "nodeguard-feeds")
 
 SPAMHAUS_CIDR = "203.0.113.0/24"
+CONTAINED_HOST = "203.0.113.7/32"
 DSHIELD_ROW = "198.51.100.0\t198.51.100.255\t24\t3\tExample"
 SPAMHAUS = "spamhaus_drop_v4"
 DSHIELD = "dshield_top20"
@@ -324,6 +325,71 @@ class RunContainmentTest(RunnerFixture):
             nxt = feeds.Runner(conf)
         self.assertTrue(nxt.adoption)
         self.assertIn("adoption mode", log.getvalue())
+
+
+class ContainedCorpseTest(RunnerFixture):
+    """Finding K2 on the bulk path: a CIDR the loader inserts clears the
+    expired host routes it now covers, which the kernel's single LPM
+    lookup would otherwise let pass inside the live CIDR."""
+
+    def block4(self):
+        """The v4 block map path the fixture's feeds write to."""
+        return f"{ngmap.PIN}/block4"
+
+    def put(self, cidr, expiry):
+        """Put one block entry in the fake map and return its network."""
+        net = ipaddress.ip_network(cidr)
+        self.fake.update_map(self.block4(), ngmap.key_bytes(net),
+                             feeds.encode_value(expiry, 0))
+        return net
+
+    def present(self, net):
+        """Whether the fake block map still holds an entry."""
+        return self.fake.lookup_value(
+            self.block4(), ngmap.key_bytes(net)) is not None
+
+    def test_insert_deletes_a_contained_corpse(self):
+        corpse = self.put(CONTAINED_HOST, expiry=1)
+        self.serve()
+        with ngtest.captured_log():
+            feeds.Runner(self.enforcing_conf()).run()
+        self.assertTrue(self.present(ipaddress.ip_network(SPAMHAUS_CIDR)))
+        self.assertFalse(self.present(corpse))
+
+    def test_insert_keeps_a_contained_live_entry(self):
+        live = self.put(CONTAINED_HOST, expiry=ngmap.mono_ns() + 10 ** 12)
+        self.serve()
+        with ngtest.captured_log():
+            feeds.Runner(self.enforcing_conf()).run()
+        self.assertTrue(self.present(live))
+
+    def test_a_corpse_arising_after_the_snapshot_waits_for_the_sweep(self):
+        # The snapshot bounds the candidates, so an entry that expires
+        # mid-run is not the insert path's to delete.
+        self.serve()
+        runner = feeds.Runner(self.enforcing_conf())
+        real_snapshot = runner.snapshot_expired
+
+        def snapshot_then_add_a_corpse():
+            snap = real_snapshot()
+            self.put(CONTAINED_HOST, expiry=1)
+            return snap
+
+        runner.snapshot_expired = snapshot_then_add_a_corpse
+        with ngtest.captured_log():
+            runner.run()
+        self.assertTrue(self.present(ipaddress.ip_network(CONTAINED_HOST)))
+
+    def test_a_corpse_this_loader_still_owns_is_not_a_candidate(self):
+        # Deleting another feed's own expired key would make that feed's
+        # reconcile log the foreign-interference warning against itself.
+        corpse = self.put(CONTAINED_HOST, expiry=1)
+        feeds.save_json(feeds.STATE, {"entries": {
+            feeds.jkey(corpse): {"feed": DSHIELD, "ref": "row",
+                                 "written_expiry_ns": 1,
+                                 "first_seen": 1.0, "last_written": 1.0}}})
+        runner = feeds.Runner(self.enforcing_conf())
+        self.assertEqual(runner.snapshot_expired()[self.block4()], [])
 
 
 class GateTest(RunnerFixture):

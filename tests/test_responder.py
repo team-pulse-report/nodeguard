@@ -28,6 +28,8 @@ HOME_NET = "192.0.2.0/24"
 SID = 1000
 TTL_BASE = 3600
 TTL_MAX = 86400
+BOOT_ID = "00000000-0000-4000-8000-000000000001"
+OTHER_BOOT_ID = "00000000-0000-4000-8000-000000000002"
 
 
 def alert(**over):
@@ -83,9 +85,28 @@ class ResponderFixture(unittest.TestCase):
         self.tmp = ngtest.temp_dir(self)
         self.journal_path = os.path.join(self.tmp, "blocks.json")
         self.sids_path = os.path.join(self.tmp, "sids.conf")
+        self.boot_path = os.path.join(self.tmp, "boot_id")
+        self.set_boot(BOOT_ID)
         ngtest.patch_attrs(self, responder,
-                           RESP_KV=os.path.join(self.tmp, "responder.kv"))
+                           RESP_KV=os.path.join(self.tmp, "responder.kv"),
+                           BOOT_ID_PATH=self.boot_path)
         self.blocks = []
+
+    def set_boot(self, value):
+        """Point the fixture's boot-id file at one boot; a later value
+        stands in for the host having rebooted."""
+        with open(self.boot_path, "w") as f:
+            f.write(value + "\n")
+
+    def write_journal(self, records, boot=BOOT_ID):
+        """Write a journal file as the responder persists it, or without
+        the reserved metadata record when boot is None (a journal from
+        before boot-id recording)."""
+        data = dict(records)
+        if boot is not None:
+            data[responder.JOURNAL_META_KEY] = {"boot_id": boot}
+        with open(self.journal_path, "w") as f:
+            json.dump(data, f)
 
     def record_block(self, src, ttl):
         """Recording stand-in for the nodeguard-block wrapper."""
@@ -116,6 +137,18 @@ class ResponderFixture(unittest.TestCase):
             responder.handle_event(line, st, now or time.time())
         return log.getvalue()
 
+    def saved_records(self):
+        """The persisted journal without the reserved metadata record,
+        which is what the daemon treats as records."""
+        with open(self.journal_path) as f:
+            return {ip: rec for ip, rec in json.load(f).items()
+                    if ip != responder.JOURNAL_META_KEY}
+
+    def saved_meta(self):
+        """The persisted reserved metadata record, or None."""
+        with open(self.journal_path) as f:
+            return json.load(f).get(responder.JOURNAL_META_KEY)
+
     def seed_journal(self, st, src=ATTACKER, **fields):
         """Put one record in the live journal and return it."""
         record = {"count": 0, "shadow_hits": 0, "blocked_until": 0,
@@ -132,7 +165,7 @@ class GateTest(ResponderFixture):
         out = self.feed(self.state(), alert(event_type="flow"))
         self.assertEqual(out, "")
         self.assertEqual(self.blocks, [])
-        self.assertEqual(st_journal(self), {})
+        self.assertEqual(self.saved_records(), {})
 
     def test_gate_2_low_severity_without_opt_in_is_dropped(self):
         st = self.state()
@@ -252,10 +285,9 @@ class GateTest(ResponderFixture):
         self.assertEqual(st.journal.data.get(ATTACKER, {}).get("count", 0), 0)
 
     def test_window_suppression_records_a_sighting(self):
-        # Behavior finding S3 will change: blocked_until survives a reboot
-        # that wiped the block map, so the responder stays quiet for a
-        # source the kernel is no longer blocking. The boot_id fix must
-        # edit this test rather than slip past it.
+        # Same-boot suppression, which finding S3's boot scoping keeps: the
+        # kernel entry genuinely covers this source. The across-a-reboot
+        # half is JournalBootTest.
         st = self.state(ENFORCE="yes")
         self.seed_journal(st, count=1, blocked_until=time.time() + 600)
         out = self.feed(st, alert())
@@ -337,8 +369,7 @@ class JournalTest(ResponderFixture):
                                        "last_seen": time.time()}}, f)
         journal = responder.Journal(self.journal_path)
         self.assertEqual(list(journal.data), ["203.0.113.2"])
-        with open(self.journal_path) as f:
-            self.assertEqual(list(json.load(f)), ["203.0.113.2"])
+        self.assertEqual(list(self.saved_records()), ["203.0.113.2"])
 
     def test_corrupt_journal_is_quarantined_and_startup_continues(self):
         with open(self.journal_path, "w") as f:
@@ -356,6 +387,100 @@ class JournalTest(ResponderFixture):
             journal = responder.Journal(self.journal_path)
         self.assertEqual(journal.data, {})
         self.assertTrue(os.path.exists(self.journal_path + ".corrupt"))
+
+
+class JournalBootTest(ResponderFixture):
+    """Finding S3: a block window outlives the kernel entry it stands for
+    when the host reboots, because bpffs maps and CLOCK_MONOTONIC do not
+    survive. Windows are therefore scoped to the boot that wrote them."""
+
+    def record(self, **fields):
+        """One journaled offender with a window still an hour out."""
+        rec = {"count": 3, "shadow_hits": 2, "blocked_until": time.time() + 3600,
+               "first_seen": 1.0, "last_seen": time.time(), "sid": SID}
+        rec.update(fields)
+        return {ATTACKER: rec}
+
+    def test_prior_boot_windows_expire_and_counts_survive(self):
+        self.write_journal(self.record(), boot=OTHER_BOOT_ID)
+        with ngtest.captured_log() as log:
+            journal = responder.Journal(self.journal_path)
+        rec = journal.data[ATTACKER]
+        self.assertEqual(rec["blocked_until"], 0)
+        self.assertEqual(rec["count"], 3)
+        self.assertEqual(rec["shadow_hits"], 2)
+        self.assertEqual(rec["first_seen"], 1.0)
+        self.assertEqual(rec["sid"], SID)
+        self.assertIn("block windows treated as expired", log.getvalue())
+
+    def test_same_boot_windows_load_unchanged(self):
+        records = self.record()
+        self.write_journal(records)
+        with ngtest.captured_log() as log:
+            journal = responder.Journal(self.journal_path)
+        self.assertEqual(journal.data[ATTACKER]["blocked_until"],
+                         records[ATTACKER]["blocked_until"])
+        self.assertEqual(log.getvalue(), "")
+
+    def test_legacy_journal_without_meta_loads_and_expires(self):
+        self.write_journal(self.record(), boot=None)
+        with ngtest.captured_log():
+            journal = responder.Journal(self.journal_path)
+        self.assertEqual(journal.data[ATTACKER]["blocked_until"], 0)
+        self.assertEqual(journal.data[ATTACKER]["count"], 3)
+
+    def test_meta_is_never_a_record_and_is_written_back(self):
+        self.write_journal(self.record())
+        with ngtest.captured_log():
+            journal = responder.Journal(self.journal_path)
+        self.assertNotIn(responder.JOURNAL_META_KEY, journal.data)
+        self.assertEqual(list(self.saved_records()), [ATTACKER])
+        self.assertEqual(self.saved_meta(), {"boot_id": BOOT_ID})
+
+    def test_repeat_offender_is_reblocked_after_a_reboot(self):
+        # The end-to-end shape of the finding: the same alert that was a
+        # silent sighting before the reboot must issue a block after it,
+        # and at the escalated TTL the retained count earns.
+        self.write_journal(self.record(count=1))
+        with ngtest.captured_log():
+            warm = self.state(ENFORCE="yes")
+        self.assertEqual(self.feed(warm, alert()), "")
+        self.assertEqual(self.blocks, [])
+
+        self.set_boot(OTHER_BOOT_ID)
+        with ngtest.captured_log():
+            rebooted = self.state(ENFORCE="yes")
+        out = self.feed(rebooted, alert())
+        self.assertIn("BLOCKED:", out)
+        self.assertEqual(self.blocks, [(ATTACKER, TTL_BASE * 2)])
+        self.assertEqual(rebooted.journal.data[ATTACKER]["count"], 2)
+
+    def test_unreadable_boot_id_expires_windows(self):
+        # Failing toward one redundant block, never toward suppression.
+        self.write_journal(self.record())
+        ngtest.patch_attrs(self, responder,
+                           BOOT_ID_PATH=os.path.join(self.tmp, "absent"))
+        with ngtest.captured_log():
+            journal = responder.Journal(self.journal_path)
+        self.assertEqual(journal.data[ATTACKER]["blocked_until"], 0)
+
+    def test_unreadable_boot_id_at_both_ends_still_expires_windows(self):
+        # The case an empty stamp would break: unreadable when the journal
+        # was written AND when it is read back. An empty id must not
+        # compare equal to itself across the reboot, so save() writes no
+        # stamp at all and the reload sees a prior-boot journal.
+        ngtest.patch_attrs(self, responder,
+                           BOOT_ID_PATH=os.path.join(self.tmp, "absent"))
+        with ngtest.captured_log():
+            journal = responder.Journal(self.journal_path)
+        journal.data.update(self.record())
+        journal.save()
+        self.assertIsNone(self.saved_meta())
+        with ngtest.captured_log() as log:
+            reloaded = responder.Journal(self.journal_path)
+        self.assertEqual(reloaded.data[ATTACKER]["blocked_until"], 0)
+        self.assertEqual(reloaded.data[ATTACKER]["count"], 3)
+        self.assertIn("block windows treated as expired", log.getvalue())
 
 
 class AllowCacheTest(ResponderFixture):
@@ -379,12 +504,6 @@ class AllowCacheTest(ResponderFixture):
         self.assertTrue(cache.protected("198.51.100.9"))
         self.assertFalse(cache.protected(ATTACKER))
         self.assertEqual(len(fake.calls), 1)  # one dump per TTL window
-
-
-def st_journal(case):
-    """The live journal contents of the last state built by a fixture."""
-    with open(case.journal_path) as f:
-        return json.load(f)
 
 
 if __name__ == "__main__":

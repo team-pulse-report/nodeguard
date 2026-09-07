@@ -84,7 +84,9 @@ All four fixes are userspace only; src/nodeguard_kern.c is not touched.
   bin/ngmap.py (cmd_block read-modify-write, contained-expired purge
   helper); bin/nodeguard-feeds (insert-path corpse deletion); new
   units/nodeguard-allow-refresh.service and .timer; deploy/deploy.sh
-  (ship the new units); docs/adr/0003 (amendment section only).
+  (ship the new units); docs/adr/0003 (amendment section only);
+  docs/design.md (the `units/` inventory gains the new pair, since
+  deploy.sh installs them on every host).
 - Rollout: this change lands in the repository and is verified
   locally. Deployment to the live hosts (devops-hive-node-2 and
   devops-hive-node-3) is a separate human-driven follow-up using the

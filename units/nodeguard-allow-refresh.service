@@ -1,0 +1,25 @@
+[Unit]
+Description=nodeguard allow-map refresh (hitless reload of nodeguard-maps)
+After=nodeguard-maps.service
+
+[Service]
+Type=oneshot
+# NOTE: reload, never restart. Reload jobs do not propagate through
+# nodeguard-xdp's Requires=, so this cannot detach the program or blip the
+# WAN link; restart propagates and would. nodeguard-maps is
+# RemainAfterExit=yes and already active, so a start job here would be a
+# no-op, which is why the timer drives this reload-invoking oneshot.
+# NOTE: the reload re-runs the WHOLE of bin/nodeguard-maps, not only the
+# allow half: its section 5 also rewrites config[0] from ng_live_wg_port,
+# falling back to the tailscale default when the ss probe comes back
+# empty. This timer therefore moves that already-accepted risk
+# (docs/design.md, "tailscaled restarts and moves its port") from
+# per-deploy to hourly. What bounds it is unchanged: the one-minute
+# watchdog rewrites config[0] from the live port
+# (bin/nodeguard-watchdog:234 to :238), so a wrong port costs at most one
+# minute during which WireGuard rides the allowlist instead of the UDP
+# hard pass.
+ExecStart=/usr/bin/systemctl reload nodeguard-maps.service
+# getaddrinfo and `tailscale debug derp-map` are the slow calls behind the
+# reload; a hung one must end as a failed job, not a stuck one.
+TimeoutStartSec=180

@@ -65,3 +65,43 @@ Every layer fails open, and expiry is checked in the datapath itself:
   prevent attach gets an unfiltered path. That is deliberate; the design
   treats loss of connectivity as strictly worse than loss of filtering on
   these hosts.
+
+## Amendment
+
+2026-09-06. Correcting the record only: the decision above stands unchanged.
+
+Decision point 3 leaves one consequence unrecorded. The block maps are LPM
+tries and the datapath performs exactly ONE lookup per family
+(`src/nodeguard_kern.c:273` in handle_v4, `:338` in handle_v6), which returns
+the LONGEST prefix match. An expired more-specific entry is therefore the
+answer for its own address even when a live broader entry covers it: a
+responder /32 that has expired inside a live feed /24 passes that one host
+(counted as `ST_PASS_EXPIRED`) while the rest of the /24 still drops. The
+window lasts until the corpse is deleted, so worst case about one sweep
+period (`units/nodeguard-sweep.timer`, `OnUnitActiveSec=10min`), and it is a
+fail-open direction affecting a single address, which is why it was survivable
+while undocumented.
+
+The kernel keeps its single lookup; a second per-packet trie walk to close a
+single-address fail-open window is the wrong trade and reopens ADR 0007's
+minute-path argument. The userspace writers close it instead, at the point
+where the coverage changes and the per-key lock is already held: a writer
+inserting an entry broader than a host route deletes the expired entries
+strictly contained in it, re-verifying each candidate's expiry immediately
+before the delete, so live and permanent contained entries are never touched
+(`bin/ngmap.py:207` `purge_contained_expired`, called from `cmd_block` at
+`bin/ngmap.py:339` and from the feeds insert path via
+`bin/nodeguard-feeds:579` `purge_covered`). A bulk reconcile bounds its
+candidates to the entries already expired when the run began
+(`bin/nodeguard-feeds:552`), so a corpse arising mid-run waits for the sweep.
+
+"At the point where the coverage changes" is the whole of the closure, and it
+is narrower than the window. The commonest case is a /32 that expires INSIDE a
+broader entry that was already live: no writer's coverage changes there, so
+no writer is on the path and the corpse is the sweep's, exactly as it was
+before this amendment. What the insert-time deletion removes is the case where
+a writer newly covers a corpse and would otherwise leave a hole it just took
+responsibility for.
+
+The sweep's semantics are unchanged by this amendment: it remains garbage
+collection only, and it is still the backstop for corpses no writer covers.

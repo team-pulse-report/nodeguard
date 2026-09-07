@@ -303,6 +303,9 @@ class Runner:
         self.candidates = 0
         self.churn_held = []
         self.map_errors = 0
+        # Expired block entries as they stood when this run began, per map
+        # path; the bounded candidate set the insert path may delete.
+        self.expired = {}
         # Map mutations this run has performed. A crash before the first
         # one wrote nothing, so crash-adoption must not arm for it.
         self.writes = 0
@@ -546,6 +549,49 @@ class Runner:
 
     # --------------------------------------------------------- reconcile
 
+    def snapshot_expired(self):
+        """Snapshot the already-expired block entries once per run, rather
+        than dumping the maps once per inserted CIDR across a feed of
+        about 1,700 entries. Bounding the candidates this way can only
+        under-delete (a corpse born mid-run waits for the sweep), never
+        over-delete, because the per-key re-verification under the lock is
+        what authorizes each delete.
+
+        Keys this loader's own journal still owns are excluded. Deleting
+        one under a broader feed's CIDR would make the narrower feed's
+        own reconcile, later in the same run, take the "previously-owned
+        key absent" branch and log the foreign-interference warning that
+        exists to report someone else deleting our entries; the loader is
+        about to rewrite those keys anyway, so nothing is left shadowing
+        that this purge would have removed."""
+        owned = set(self.state["entries"])
+        snap = {}
+        for path in (f"{ngmap.PIN}/block4", f"{ngmap.PIN}/block6"):
+            try:
+                snap[path] = [net for net in ngmap.expired_entries(path)
+                              if jkey(net) not in owned]
+            except RuntimeError as e:
+                log(f"feeds: expired-entry snapshot unavailable for "
+                    f"{path}: {e}; the sweep remains the backstop")
+                snap[path] = []
+        return snap
+
+    def purge_covered(self, path, net):
+        """Delete the snapshotted corpses a just-inserted network now
+        covers, called with block_lock held.
+        SAFETY: an expired more-specific entry is the kernel's longest
+        match for its own address and passes it while the broader CIDR
+        drops the rest of the range (one LPM lookup by design). A failed
+        purge cannot fail the key: the insert already landed, and the
+        sweep still deletes the corpse."""
+        if net.prefixlen >= net.max_prefixlen:
+            return
+        try:
+            ngmap.purge_contained_expired(path, net,
+                                          self.expired.get(path, ()))
+        except RuntimeError as e:
+            self.dline(f"purge-error {net}: {e}")
+
     def _mutate(self, fn, feed, k):
         """Run one map write for a key, containing any bpftool error to that single key.
         SAFETY: one bpftool failure costs one key, never the batch;
@@ -611,6 +657,7 @@ class Runner:
                 if row is not None and cur is None:
                     ngmap.update_map(path, keyb, encode_value(expiry, 0))
                     self.writes += 1
+                    self.purge_covered(path, net)
                     row.update(written_expiry_ns=expiry,
                                last_written=self.now, ref=ref)
                     counts["insert"] += 1
@@ -620,6 +667,7 @@ class Runner:
                 if cur is None:
                     ngmap.update_map(path, keyb, encode_value(expiry, 0))
                     self.writes += 1
+                    self.purge_covered(path, net)
                     entries[k] = {"feed": feed, "ref": ref,
                                   "written_expiry_ns": expiry,
                                   "first_seen": self.now,
@@ -631,6 +679,7 @@ class Runner:
                     # expired corpse enforces nothing for anyone: adopt
                     ngmap.update_map(path, keyb, encode_value(expiry, 0))
                     self.writes += 1
+                    self.purge_covered(path, net)
                     entries[k] = {"feed": feed, "ref": ref,
                                   "written_expiry_ns": expiry,
                                   "first_seen": self.now,
@@ -644,6 +693,7 @@ class Runner:
                     ngmap.update_map(path, keyb,
                                      encode_value(expiry, cur_hits))
                     self.writes += 1
+                    self.purge_covered(path, net)
                     entries[k] = {"feed": feed, "ref": ref,
                                   "written_expiry_ns": expiry,
                                   "first_seen": self.now,
@@ -745,6 +795,7 @@ class Runner:
             if recs is not None:
                 per_feed[feed] = recs
         self.gate(per_feed, allow)
+        self.expired = self.snapshot_expired()
 
         summary = {}
         for feed in feeds:

@@ -22,7 +22,9 @@ gate must update both.
 
 TTL escalation counts OFFENSES (block windows), not alert lines: while a
 source is inside its blocked_until window, further alerts refresh
-last_seen only. Dry-run (ENFORCE=no, the mandatory first-run mode) logs
+last_seen only. Windows belong to the boot they were written under and
+load as expired under any other one, because the kernel's blocks do not
+survive a reboot. Dry-run (ENFORCE=no, the mandatory first-run mode) logs
 WOULD BLOCK and simulates the same windows so the shadow stream is an
 accurate rehearsal of enforcement. Stdlib only; stdout goes to journald.
 """
@@ -40,11 +42,31 @@ RESP_KV = "/run/nodeguard/responder.kv"
 NGMAP = "/usr/local/lib/nodeguard/ngmap.py"
 BLOCK = "/usr/local/sbin/nodeguard-block"
 ALLOW_CACHE_TTL = 60
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+
+# INVARIANT: reserved top-level journal key, never an address. Journal
+# record keys are IP address strings, so this cannot collide with one.
+JOURNAL_META_KEY = "_meta"
 
 
 def log(msg):
     """Print a line to stdout and flush immediately so journald captures it in order."""
     print(msg, flush=True)
+
+
+def boot_id():
+    """Return the kernel's current boot id, empty when it cannot be read.
+    SAFETY: an unreadable boot id compares unequal to any journaled one,
+    because save() stamps no boot id at all when this returns empty; so
+    windows load as expired even when both ends failed to read it. That
+    fails toward one redundant block of an address the kernel may already
+    cover, never toward suppressing a block the kernel is not
+    enforcing."""
+    try:
+        with open(BOOT_ID_PATH) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def load_conf():
@@ -156,16 +178,27 @@ class Journal:
     TTL exponent), and shadow_hits only on a non-offense observation
     (dry-run sighting, rate-capped repeat); conflating the two would
     escalate TTL on mere observations. blocked_until = wall clock end of
-    the current (real or shadow) window."""
+    the current (real or shadow) window.
+    SAFETY: windows are scoped to the boot they were written under. The
+    block maps live on bpffs and their CLOCK_MONOTONIC expiries reset at
+    reboot (ADR 0003), so a window carried across a reboot would suppress
+    re-blocking (handle_event's window check) on behalf of a kernel entry
+    that no longer exists; the longest-escalated attackers carry the
+    longest windows and would get the longest free pass."""
 
     def __init__(self, path):
         """Load the per-IP offense journal from disk, quarantining a corrupt file and starting fresh rather than crashing."""
         self.path = path
+        self.boot = boot_id()
         self.data = {}
+        meta = None
         try:
             with open(path) as f:
                 raw = json.load(f)
             if isinstance(raw, dict):
+                # Popped BEFORE the record filter, so the reserved record
+                # can never be read back as an address.
+                meta = raw.pop(JOURNAL_META_KEY, None)
                 self.data = {ip: rec for ip, rec in raw.items()
                              if isinstance(rec, dict)}
             else:
@@ -181,7 +214,23 @@ class Journal:
             except OSError:
                 log(f"responder: journal unreadable ({e}); starting fresh")
             self.data = {}
+        if not isinstance(meta, dict) or meta.get("boot_id") != self.boot:
+            self.expire_windows()
         self.prune()
+
+    def expire_windows(self):
+        """Treat every persisted block window as over, keeping the offense
+        history that drives escalation (count, shadow_hits, first_seen,
+        last_seen, sid) so a repeat offender's re-block still lands with
+        its escalated TTL."""
+        stale = 0
+        for rec in self.data.values():
+            if rec.get("blocked_until", 0):
+                stale += 1
+            rec["blocked_until"] = 0
+        if stale:
+            log(f"responder: journal written under another boot; {stale} "
+                "block windows treated as expired (offense counts kept)")
 
     def prune(self):
         """Drop journal records not seen in 30 days and persist, keeping the file bounded."""
@@ -191,11 +240,20 @@ class Journal:
         self.save()
 
     def save(self):
-        """Persist the journal to disk atomically (temp file then rename)."""
+        """Persist the journal to disk atomically (temp file then rename),
+        stamped with the boot id its windows belong to."""
         tmp = self.path + ".tmp"
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        payload = dict(self.data)
+        # SAFETY: stamp only a boot id that was actually read. An empty
+        # stamp would compare EQUAL to an equally unreadable boot id at
+        # the next load and carry windows across a reboot, which is the
+        # suppression this scoping exists to remove; an absent stamp
+        # loads as prior-boot and expires them.
+        if self.boot:
+            payload[JOURNAL_META_KEY] = {"boot_id": self.boot}
         with open(tmp, "w") as f:
-            json.dump(self.data, f)
+            json.dump(payload, f)
         os.replace(tmp, self.path)
 
     def _rec(self, ip):
