@@ -40,7 +40,7 @@ Quality goals, in priority order:
 2. **Unspoofable automated enforcement.** A blind spoofed packet must
    never be able to insert a block. Automated blocks require severity-1
    TCP alerts with bidirectional flow evidence
-   (`bin/nodeguard-responder:371`).
+   (`bin/nodeguard-responder:471`).
 3. **Monitoring before enforcement.** No phase of the bring-up attaches
    or enforces anything that cannot already raise an alarm when it
    breaks.
@@ -139,9 +139,9 @@ External interfaces:
 | Upstream DNS resolvers (Quad9) | out | Allowlisted; also a watchdog lifeline probe |
 | `api.anthropic.com` | read | Resolved into the protected-remotes allowlist (`etc/protected.conf`) |
 | Canary target (e.g. `1.1.1.1:443`) | out | Deliberately non-allowlisted watchdog probe (ADR 0005) |
-| Spamhaus DROP v4 / v6 (`drop_v4.json`, `drop_v6.json`) | out | HTTPS fetch by `nodeguard-feeds` every 6 h (`bin/nodeguard-feeds:59`, `units/nodeguard-feeds.timer`) |
-| DShield block list (`block.txt`) | out | HTTPS fetch by `nodeguard-feeds` every 6 h; dry-run only until promoted (`bin/nodeguard-feeds:65`) |
-| The Zabbix server | in | Polls the agent's `nodeguard.kv[*]` items, backed by the watchdog's per-minute kv export to `/run/zabbix/nodeguard.kv` (section 8); journal CRITICALs are the out-of-band channel |
+| Spamhaus DROP v4 / v6 (`drop_v4.json`, `drop_v6.json`) | out | HTTPS fetch by `nodeguard-feeds` every 6 h (`bin/nodeguard-feeds:68`, `units/nodeguard-feeds.timer`) |
+| DShield block list (`block.txt`) | out | HTTPS fetch by `nodeguard-feeds` every 6 h; dry-run only until promoted (`bin/nodeguard-feeds:74`) |
+| The Zabbix server | in | Polls the agent's `nodeguard.kv[*]` items, backed by the watchdog's per-minute kv export to `/run/nodeguard/nodeguard.kv` (section 8); journal CRITICALs are the out-of-band channel |
 | A build host (container) | n/a | Compiles the object, generates the spec, rehearses attach |
 | Operator over SSH | in | `deploy/deploy.sh` pushes files; bring-up is manual |
 
@@ -231,10 +231,10 @@ parameter drift; enum at `src/nodeguard_kern.c:62`, map at
   `block4`/`block6` with a 25 h in-kernel TTL. Ownership is a journal
   plus compare-and-swap on the written expiry value, never a map dump
   (the block maps have other writers); a feed that failed this run
-  performs zero withdrawals (invariant W1, `bin/nodeguard-feeds:9`).
+  performs zero withdrawals (invariant W1, `bin/nodeguard-feeds:10`).
   Enforcement needs a double gate: the feed listed in `FEEDS_APPLY` in
   the deployed config AND recorded in `approved.json` by an interactive
-  `apply --confirm` (`bin/nodeguard-feeds:22`). Exports `ng.feeds_*` kv
+  `apply --confirm` (`bin/nodeguard-feeds:23`). Exports `ng.feeds_*` kv
   state to `/var/lib/nodeguard/feeds/feeds.kv`.
 - `nodeguard-watchdog`: one probe cycle per minute (section 6.3).
 - `nodeguard-canary`: the remote node's self-recovering first-attach
@@ -334,7 +334,7 @@ pinned block map -> XDP drop on the offender's next packet.`
 
 The responder (`bin/nodeguard-responder`) tails `eve.json` tail-F
 style, reopening across rotation and starting at the end (never
-replaying; `bin/nodeguard-responder:235`). All gates must pass before
+replaying; `bin/nodeguard-responder:340`). All gates must pass before
 any block:
 
 1. `event_type == "alert"` only.
@@ -342,7 +342,7 @@ any block:
    SIDs on the ignore list are dropped first.
 3. Anti-spoofing gate: protocol must be TCP with
    `flow.pkts_toclient >= 1` and `flow.pkts_toserver >= 2`
-   (`bin/nodeguard-responder:371`). UDP and ICMP alerts are logged as
+   (`bin/nodeguard-responder:471`). UDP and ICMP alerts are logged as
    `WOULD BLOCK (udp/icmp, not eligible)` unless the SID is
    hand-promoted with `udp-ok` plus a written justification (ADR 0002).
 4. Inbound only: destination in `HOME_NETS`, source globally routable.
@@ -350,10 +350,10 @@ any block:
    ranges (userspace re-check via `ngmap.py allow-check`; the kernel
    allow map is the backstop).
 6. Rate caps: 30 new blocks per rolling minute, 500 per hour
-   (`bin/nodeguard-responder:264`); on breach it stops adding and logs
+   (`bin/nodeguard-responder:511`); on breach it stops adding and logs
    loudly.
 7. Action: block the source `/32` or `/128` for TTL 3600 s, doubling
-   per repeat offense up to 86400 s (`bin/nodeguard-responder:262`),
+   per repeat offense up to 86400 s (`bin/nodeguard-responder:541`),
    journaled in `/var/lib/nodeguard/blocks.json` (pruned at 30 days,
    never re-armed after reboot).
 
@@ -371,35 +371,35 @@ Every minute (`units/nodeguard-watchdog.timer:6`),
 `bin/nodeguard-watchdog` runs one cycle:
 
 - **kv export, first**: writes the `nodeguard-status --kv` snapshot to
-  `/run/zabbix/nodeguard.kv` (tmp then rename;
-  `bin/nodeguard-watchdog:16`). This is the entry point of the entire
+  `/run/nodeguard/nodeguard.kv` (tmp then rename;
+  `bin/nodeguard-watchdog:20`). This is the entry point of the entire
   monitoring chain (section 8) and runs before the maps-exist guard, so
   monitoring keeps reporting even on a host where nodeguard is not yet
   set up.
 - **Anomaly detector** (ADR 0007 layer 1, implemented;
-  `bin/nodeguard-watchdog:19`): a per-cycle EWMA baseline over deltas
+  `bin/nodeguard-watchdog:22`): a per-cycle EWMA baseline over deltas
   of drop, pass, sanity-counter, and alert totals, computed from the kv
   snapshot just written. Ships in shadow mode by default
   (`WD_ANOM_MODE=shadow`; shadow logs and exports
   `ng.anomaly_shadow_count` while `anomaly_count` stays 0), tunables
   `WD_ANOM_K=8`, `WD_ANOM_FLOOR=500` per cycle, `WD_ANOM_TRIP=3`,
-  `WD_ANOM_ADAPT=30` (`bin/nodeguard-watchdog:24`). Robustness rules,
+  `WD_ANOM_ADAPT=30` (`bin/nodeguard-watchdog:27`). Robustness rules,
   all implemented: a stale or re-read kv snapshot discards the cycle
-  without touching the baseline (`bin/nodeguard-watchdog:94`); regime
+  without touching the baseline (`bin/nodeguard-watchdog:109`); regime
   changes (kill switch, attach state, feeds enforce) reseed the EWMA
-  state (`bin/nodeguard-watchdog:102`); a program-id change (reload or
+  state (`bin/nodeguard-watchdog:114`); a program-id change (reload or
   reboot) discards exactly one cycle and keeps the trained baseline
-  (`bin/nodeguard-watchdog:105`), as does a negative delta (counter
-  reset; `bin/nodeguard-watchdog:130`); an anomalous cycle updates no
+  (`bin/nodeguard-watchdog:117`), as does a negative delta (counter
+  reset; `bin/nodeguard-watchdog:132`); an anomalous cycle updates no
   metric's mean or deviation until each metric's own bounded skip
   streak forces adaptation, so an attack cannot train the detector
-  into silence (`bin/nodeguard-watchdog:135`); and a trip fires on the
+  into silence (`bin/nodeguard-watchdog:160`); and a trip fires on the
   transition only, one trip per episode
-  (`bin/nodeguard-watchdog:158`). Observe-only in every mode: it never
+  (`bin/nodeguard-watchdog:173`). Observe-only in every mode: it never
   touches the kill switch, latch files, or any map.
 - **Port refresh**: compares `config[0]` against the port tailscaled
   actually bound (`ss -ulpn`) and rewrites it on change
-  (`bin/nodeguard-watchdog:214`). The tailscale RPM restarts tailscaled
+  (`bin/nodeguard-watchdog:239`). The tailscale RPM restarts tailscaled
   mid-update and can move the port; this closes the window within a
   minute.
 - **Lifeline probes** (allowlisted paths, from `LIFELINES` in
@@ -415,15 +415,15 @@ Every minute (`units/nodeguard-watchdog.timer:6`),
 - **Triggers** (with a program attached and the kill switch clear):
   three consecutive canary failures while at least one lifeline passes
   means suspected over-blocking: `nodeguard-off --watchdog`, CRITICAL
-  with the stats snapshot as evidence (`bin/nodeguard-watchdog:336`).
+  with the stats snapshot as evidence (`bin/nodeguard-watchdog:371`).
   Five consecutive cycles of all lifelines failing: soft-off, since the
   cause may be an upstream outage nodeguard did not create
-  (`bin/nodeguard-watchdog:339`).
+  (`bin/nodeguard-watchdog:374`).
 - **Latched**: ten further all-fail cycles detach the XDP program
-  entirely (`bin/nodeguard-watchdog:345`). If the latch was
+  entirely (`bin/nodeguard-watchdog:380`). If the latch was
   watchdog-set (no manual marker), 15 fully clean cycles re-arm
   enforcement once per boot, tracked in `config[2]`
-  (`bin/nodeguard-watchdog:364`). Any second latch, and any manual
+  (`bin/nodeguard-watchdog:400`). Any second latch, and any manual
   `nodeguard-off`, is human-only recovery. While latched, a CRITICAL
   reminder repeats hourly.
 
@@ -505,7 +505,7 @@ On-host layout (installed by `deploy/deploy.sh`):
 | `/etc/nodeguard/` | `nodeguard.env`, `allow4.txt`, `allow6.txt`, `responder.conf`, `protected.conf`, `sids.conf` |
 | `/etc/systemd/system/` | units, timers, the per-host device drop-in, the Suricata limits drop-in |
 | `/sys/fs/bpf/nodeguard/` | the seven pinned maps (reset at boot) |
-| `/run/nodeguard/` | prog id, watchdog counters, latch markers, `responder.kv` counters (tmpfs, tmpfiles.d) |
+| `/run/nodeguard/` | prog id, watchdog counters, latch markers, `responder.kv` counters, the `nodeguard.kv` and `geo.kv` monitoring exports (tmpfs, tmpfiles.d) |
 | `/var/lib/nodeguard/` | `blocks.json` responder journal, `mapstat.kv` sweep cache, `wd_baseline.json` and `wd_anomaly.kv` anomaly-detector state, `feeds/` loader state |
 
 Build: `docker run --rm --privileged -v "$PWD:/work" fedora:44 /bin/bash
@@ -590,7 +590,7 @@ latches for a human.
 Automated enforcement must be unspoofable. The responder blocks only on
 TCP alerts whose flow counters prove bidirectional exchange
 (`pkts_toclient >= 1`, `pkts_toserver >= 2`;
-`bin/nodeguard-responder:371`): TCP sequence numbers make completing or
+`bin/nodeguard-responder:471`): TCP sequence numbers make completing or
 continuing a handshake blind infeasible, so a blind attacker cannot
 fabricate a flow this host answered and then continued. Spoofed single
 UDP or ICMP packets, the trivial poisoning vector against any address
@@ -618,8 +618,8 @@ break-glass tools.
 ### Monitoring chain
 
 One direction, one file handoff: `nodeguard-watchdog` writes the
-`nodeguard-status --kv` snapshot to `/run/zabbix/nodeguard.kv` every
-minute (`bin/nodeguard-watchdog:16`); the Zabbix agent's UserParameter
+`nodeguard-status --kv` snapshot to `/run/nodeguard/nodeguard.kv` every
+minute (`bin/nodeguard-watchdog:20`); the Zabbix agent's UserParameter
 reads that file (`etc/zabbix-userparameter-nodeguard.conf:7`); the
 template turns the keys into items and triggers, including the
 `ng.feeds_*` items with their per-feed staleness and config-drift
@@ -662,16 +662,16 @@ staleness of the whole chain is one `fuzzytime` check.
 | `feeds.conf` | `FEEDS_TTL_S` | `90000` | In-kernel TTL (25 h) written per feed entry; every failure decays to no enforcement |
 | `feeds.conf` | `FEEDS_MAX_V4` / `FEEDS_MAX_V6` | `8192` / `2048` | Per-family entry caps across all surviving feeds |
 | `feeds.conf` | `FEEDS_MAX_BYTES` | `4194304` | Fetched body size cap |
-| `feeds.conf` | `FEEDS_V6_FLOOR` | `19` | Shortest accepted IPv6 prefix; shorter fails the whole feed (`bin/nodeguard-feeds:405`) |
+| `feeds.conf` | `FEEDS_V6_FLOOR` | `19` | Shortest accepted IPv6 prefix; shorter fails the whole feed (`bin/nodeguard-feeds:477`) |
 | `feeds.conf` | `FEEDS_MAX_COVERAGE_V4` | `67108864` | Aggregate v4 address-coverage cap; exceeding it aborts the run |
 | `feeds.conf` | `FEEDS_MAX_COVERAGE_V6_48` | `46137344` | Aggregate v6 coverage cap in /48 equivalents; exceeding it aborts the run |
 | `feeds.conf` | `FEEDS_MAX_CHURN_PCT` | `30` | Composition churn brake; a larger swing is held for operator review |
 | `feeds.conf` | `FEEDS_MAX_STALE_S` | `1209600` | Upstream snapshot staleness cap (14 days); a staler feed fails and its entries decay |
-| `nodeguard.env` | `WD_ANOM_MODE` / `WD_ANOM_K` / `WD_ANOM_FLOOR` / `WD_ANOM_TRIP` / `WD_ANOM_ADAPT` | `shadow` / `8` / `500` / `3` / `30` | Anomaly-detector tunables (`bin/nodeguard-watchdog:24`): mode `off`/`shadow`/`on` (shadow logs and exports `ng.anomaly_shadow_count` while `anomaly_count` stays 0), deviation multiplier, per-cycle absolute floor, consecutive-cycle trip count, per-metric bounded skip streak |
+| `nodeguard.env` | `WD_ANOM_MODE` / `WD_ANOM_K` / `WD_ANOM_FLOOR` / `WD_ANOM_TRIP` / `WD_ANOM_ADAPT` | `shadow` / `8` / `500` / `3` / `30` | Anomaly-detector tunables (`bin/nodeguard-watchdog:27`): mode `off`/`shadow`/`on` (shadow logs and exports `ng.anomaly_shadow_count` while `anomaly_count` stays 0), deviation multiplier, per-cycle absolute floor, consecutive-cycle trip count, per-metric bounded skip streak |
 | build-time | `NG_TTL_LOW_FLOOR` | `5` | TTL-outlier counting floor for the stats2 `ttl_low` counter (`src/nodeguard_kern.c:35`); telemetry threshold only, never a verdict input |
 
 `sids.conf` is reloaded live on mtime change
-(`bin/nodeguard-responder:321`); the allow files and `protected.conf`
+(`bin/nodeguard-responder:601`); the allow files and `protected.conf`
 take effect at the next maps-service start.
 
 ### Observability and error handling
@@ -701,7 +701,7 @@ to 0 (`bin/nodeguard-status:11`). One accepted artifact: during a
 hitless reload both dispatcher members briefly count the same traffic,
 so the cycle spanning a program-id change can double-count `pass`; the
 anomaly detector discards exactly that cycle
-(`bin/nodeguard-watchdog:105`).
+(`bin/nodeguard-watchdog:117`).
 
 Scripts log through `ng_log` to the journal with severity; the
 watchdog's CRITICALs carry evidence (the stats snapshot on an
@@ -771,7 +771,7 @@ One bullet per ADR; the rationale and evidence live in the ADRs under
 - **Runtime self-verification**: attach refuses on map-identity
   divergence; maps service refuses on spec drift or a canary-covering
   allow entry; the responder refuses to start with empty `HOME_NETS`
-  (`bin/nodeguard-responder:84`).
+  (`bin/nodeguard-responder:119`).
 - **Operational gates**: monitoring items exist before the first attach
   (phase 2 entry gate); alarm drills must fire before enforcement
   (phase 2 exit gate); the responder runs a mandatory dry-run of 48 to

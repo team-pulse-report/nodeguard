@@ -149,9 +149,10 @@ verify_fail=0
 for u in nodeguard-maps.service nodeguard-xdp.service nodeguard-responder.service \
          nodeguard-sweep.service nodeguard-watchdog.service suricata-update.service \
          nodeguard-feeds.service nodeguard-allow-refresh.service \
+         nodeguard-geo.service \
          nodeguard-sweep.timer nodeguard-watchdog.timer \
          suricata-update.timer nodeguard-feeds.timer \
-         nodeguard-allow-refresh.timer; do
+         nodeguard-allow-refresh.timer nodeguard-geo.timer; do
     out=$(systemd-analyze verify "/etc/systemd/system/$u" 2>&1 | grep -v 'Unit is bound' || true)
     if [ -n "$out" ]; then
         echo "UNIT VERIFY FAILED: $u"

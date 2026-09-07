@@ -43,14 +43,21 @@ directories or upstreams they should not.
   depends on umask. nodeguard-geo's write_atomic additionally opens its
   temp file with O_CREAT|O_EXCL|O_NOFOLLOW as defense in depth.
   responder.kv already lives in /run/nodeguard and is the pattern.
-- Add systemd hardening to all eight service units (the seven nodeguard
+- Add systemd hardening to all nine service units (the eight nodeguard
   units plus suricata-update): NoNewPrivileges=yes, ProtectSystem=strict
   with explicit per-unit ReadWritePaths, ProtectHome=yes,
   PrivateTmp=yes, a per-unit CapabilityBoundingSet, and
   SystemCallFilter=@system-service with bpf (and perf_event_open for the
   XDP loader unit) added explicitly where the unit's commands need
   bpf(2). Per-unit needs are derived from what each script actually
-  touches and tabulated in design.md.
+  touches and tabulated in design.md, including the three DAC
+  capabilities the measured Suricata file and socket permissions make
+  necessary (the responder's CAP_DAC_READ_SEARCH for the 0750
+  /var/log/suricata, the watchdog's and suricata-update's
+  CAP_DAC_OVERRIDE for the 0660 command socket and the 2770
+  /var/lib/suricata). The bpffs pin entry carries systemd's "-" prefix
+  because that directory is created at runtime and does not survive a
+  reboot.
 - Pin the feeds fetch to https after redirects: a response whose final
   URL (urllib's r.geturl()) is not https:// fails that one feed through
   the existing failed:* path (zero writes, zero withdrawals, staleness
@@ -76,10 +83,12 @@ directories or upstreams they should not.
   bin/nodeguard-watchdog (kv export path, anomaly reader path);
   bin/nodeguard-status (geo.kv read path);
   etc/zabbix-userparameter-nodeguard.conf (both UserParameter lines);
-  units/nodeguard-feeds.service, nodeguard-geo.service,
-  nodeguard-maps.service, nodeguard-responder.service,
-  nodeguard-sweep.service, nodeguard-watchdog.service,
-  nodeguard-xdp.service, suricata-update.service (hardening blocks);
+  units/nodeguard-allow-refresh.service, nodeguard-feeds.service,
+  nodeguard-geo.service, nodeguard-maps.service,
+  nodeguard-responder.service, nodeguard-sweep.service,
+  nodeguard-watchdog.service, nodeguard-xdp.service,
+  suricata-update.service (hardening blocks);
+  deploy/deploy.sh (the geo unit added to the unit verify loop);
   bin/nodeguard-feeds (fetch scheme pinning);
   bin/nodeguard-responder (Journal debounce and record-creation cap);
   README.md:76 and docs/design.md lines 144, 369, 503, 616 (the
@@ -106,7 +115,11 @@ directories or upstreams they should not.
     EROFS in either landing order.
   - fix-nodeguard-deploy-reliability adds TimeoutStartSec to the same
     unit files; those edits are directive-disjoint from the hardening
-    block and merge cleanly in any order.
+    block and merge cleanly in any order. Its R2 owns the deploy.sh unit
+    manifest; this change adds only nodeguard-geo.service and
+    nodeguard-geo.timer to the verify loop, so that the geo unit's new
+    hardening block is checked on the host, and R2 should replace the
+    hand list rather than extend it further.
 - Rollout (human follow-up, not blocking tasks): deploy to node-2 and
   node-3 via deploy.sh, then verify on host: systemd-analyze security
   score per unit before and after; one observed full cycle per timer
@@ -114,9 +127,13 @@ directories or upstreams they should not.
   tagged ng_log line landing in the journal at its stated priority
   from inside a hardened unit, the watchdog soft-off systemctl cycle
   completing, and a suricatasc reload succeeding (proving socket
-  connects need no writable-mount exception); ownership of
-  /var/lib/suricata and the /run/suricata socket checked before
-  trimming suricata-update's CAP_DAC_OVERRIDE; and
+  connects need no writable-mount exception); the responder opening
+  /var/log/suricata/eve.json under its bounding set, and
+  ng.suricata_drops and ng.suricata_alerts both still present in
+  /run/nodeguard/nodeguard.kv after a hardened watchdog cycle, since
+  either key going missing raises no alarm today; ownership of
+  /var/lib/suricata and the /run/suricata socket re-checked before
+  trimming any DAC capability; and
   zabbix_get or zabbix_agent2 -t against nodeguard.kv.raw proving the
   agent reads /run/nodeguard (agent SELinux denials are dontaudit'd, so
   test the item, not the audit log; if the read is denied, apply the

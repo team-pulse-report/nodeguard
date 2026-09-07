@@ -12,6 +12,24 @@ ExecStart=/usr/local/sbin/nodeguard-maps
 # link blip. systemctl RESTART of this unit propagates and blips the
 # link; use reload.
 ExecReload=/usr/local/sbin/nodeguard-maps
+# Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
+# /proc, and /sys writable, so the bpffs pin directory keeps working; it
+# is listed anyway as documentation and against a semantics change.
+# Unix socket connects (journald, tailscaled) need no writable mount.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOTE: the "-" prefix is mandatory, not style. The pin directory is
+# bpffs: it is gone after every reboot and recreated at runtime by
+# nodeguard-maps, and an unprefixed ReadWritePaths entry naming a path
+# that does not exist yet fails the unit at namespace setup
+# (status 226/NAMESPACE) before ExecStart ever runs.
+ReadWritePaths=/run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN
+# NOTE: bpf(2) sits in systemd's @privileged group, not @system-service,
+# so every unit that runs bpftool has to name it explicitly.
+SystemCallFilter=@system-service bpf
 
 [Install]
 WantedBy=multi-user.target

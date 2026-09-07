@@ -10,7 +10,7 @@ empty/unknown result and nothing else in the system notices. Run from a
 timer, never in the datapath.
 
 Outputs (atomic tmp+rename):
-- /run/zabbix/geo.kv: ng.geo_* fields (top attacker countries, totals)
+- /run/nodeguard/geo.kv: ng.geo_* fields (top attacker countries, totals)
   cat'd into the monitoring snapshot by nodeguard-status.
 - /var/lib/nodeguard/attack-map.svg: a self-contained world map with the
   top blocked sources plotted, sized by hit volume; served to the
@@ -34,11 +34,15 @@ import sys
 PIN = "/sys/fs/bpf/nodeguard"
 DBIP_STARTS = "/usr/local/share/nodeguard/dbip.starts"
 DBIP_RECS = "/usr/local/share/nodeguard/dbip.recs"
-GEO_KV = "/run/zabbix/geo.kv"
+# INVARIANT: kv output lands in root-owned /run/nodeguard, never in the
+# agent-owned /run/zabbix; etc/tmpfiles-nodeguard.conf creates it root:root
+# 0755 and etc/zabbix-userparameter-nodeguard.conf reads it from there.
+GEO_KV = "/run/nodeguard/geo.kv"
 MAP_SVG = "/var/lib/nodeguard/attack-map.svg"
 BPFTOOL = "/usr/sbin/bpftool"
 TOP_N = 200          # cap the geoip work: only the busiest sources
 MAP_POINTS = 60      # dots drawn on the map
+OUT_MODE = 0o644     # explicit: agent readability must not ride the umask
 
 
 def log(msg):
@@ -156,10 +160,25 @@ def render_svg(points):
         f'blocked attack sources (dot size = hit volume)</text></svg>')
 
 
-def write_atomic(path, content, mode="w"):
+def write_atomic(path, content):
+    """Publish content at path through a temp file, then rename.
+    SAFETY: the temp path is predictable, so it is unlinked and recreated
+    with O_EXCL|O_NOFOLLOW instead of opened: a symlink pre-placed there is
+    removed, never followed, so its target is never opened, truncated, or
+    renamed over and no root write can be redirected.
+    INVARIANT: the published file carries OUT_MODE explicitly; the open
+    mode argument is masked by the umask, and monitoring reads these files
+    as the unprivileged agent."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, mode) as f:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 OUT_MODE)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), OUT_MODE)
         f.write(content)
     os.replace(tmp, path)
 

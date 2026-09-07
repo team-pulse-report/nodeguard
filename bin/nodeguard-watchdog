@@ -12,15 +12,18 @@ mkdir -p "$NG_RUN"
 # Export the status snapshot for the monitoring agent. SELinux keeps
 # zabbix_agent_t from making bpf() syscalls (sudo does not change the
 # domain), so the agent reads this file instead of running the tools.
-if [ -d /run/zabbix ]; then
-    /usr/local/sbin/nodeguard-status --kv > /run/zabbix/nodeguard.kv.tmp 2>/dev/null         && chmod 0644 /run/zabbix/nodeguard.kv.tmp         && mv -f /run/zabbix/nodeguard.kv.tmp /run/zabbix/nodeguard.kv || true
-fi
+# INVARIANT: the export lands in root-owned /run/nodeguard, never in
+# agent-owned /run/zabbix, so the unprivileged agent identity can neither
+# pre-place a symlink at the predictable temp path nor replace the
+# snapshot with fabricated content. Dependents: the anomaly detector
+# below, etc/zabbix-userparameter-nodeguard.conf, bin/nodeguard-status.
+/usr/local/sbin/nodeguard-status --kv > /run/nodeguard/nodeguard.kv.tmp 2>/dev/null         && chmod 0644 /run/nodeguard/nodeguard.kv.tmp         && mv -f /run/nodeguard/nodeguard.kv.tmp /run/nodeguard/nodeguard.kv || true
 
 # --- volumetric anomaly detector (ADR 0007 layer 1) ---
 # Runs off the kv snapshot just written: one consistent source. Shadow by
 # default; observe-only in every mode (never touches the kill switch,
 # latch files, or any map).
-if [ "${WD_ANOM_MODE:-shadow}" != "off" ] && [ -f /run/zabbix/nodeguard.kv ]; then
+if [ "${WD_ANOM_MODE:-shadow}" != "off" ] && [ -f /run/nodeguard/nodeguard.kv ]; then
     WD_ANOM_MODE="${WD_ANOM_MODE:-shadow}"     WD_ANOM_K="${WD_ANOM_K:-8}" WD_ANOM_FLOOR="${WD_ANOM_FLOOR:-500}"     WD_ANOM_TRIP="${WD_ANOM_TRIP:-3}" WD_ANOM_ADAPT="${WD_ANOM_ADAPT:-30}"     python3 - <<'ANOMPY' | while read -r line; do ng_log "$line" crit; done
 import json, os, time
 
@@ -28,10 +31,10 @@ import json, os, time
 # against a temporary directory by the unit suite; the bash wrapper sets
 # none of them, so production reads and writes exactly these defaults.
 # They are a unit-test seam only: the wrapper's kv writer and its own
-# existence guard above still name /run/zabbix/nodeguard.kv literally, so
-# setting WD_ANOM_KV outside the suite moves what the detector reads
+# existence guard above still name /run/nodeguard/nodeguard.kv literally,
+# so setting WD_ANOM_KV outside the suite moves what the detector reads
 # without moving what gates or produces it, and is not supported.
-KV = os.environ.get("WD_ANOM_KV", "/run/zabbix/nodeguard.kv")
+KV = os.environ.get("WD_ANOM_KV", "/run/nodeguard/nodeguard.kv")
 STATE = os.environ.get("WD_ANOM_STATE", "/var/lib/nodeguard/wd_baseline.json")
 OUT = os.environ.get("WD_ANOM_OUT", "/var/lib/nodeguard/wd_anomaly.kv")
 MODE = os.environ["WD_ANOM_MODE"]

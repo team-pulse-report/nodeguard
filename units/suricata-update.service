@@ -7,3 +7,20 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/bin/suricata-update
 ExecStartPost=-/usr/bin/suricatasc -c ruleset-reload-nonblocking
+# Hardening (evaluation finding S2). No bpf(2) here: this unit only
+# fetches rules and pokes the Suricata command socket, which is a socket
+# connect a read-only mount permits. /var/lib/nodeguard is writable for
+# the update stamp close-nodeguard-alerting-gaps adds, so that stamp
+# cannot fail on EROFS in either landing order.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/suricata /var/lib/nodeguard
+# CAP_DAC_OVERRIDE is required, not provisional: /var/lib/suricata is
+# 2770 suricata:suricata and the /run/suricata command socket is 0660
+# suricata:suricata on both gateways (measured 2026-09-06), and root
+# without it can neither write a directory it does not own nor connect
+# to a group-restricted socket.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+SystemCallFilter=@system-service

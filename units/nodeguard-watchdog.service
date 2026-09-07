@@ -4,3 +4,29 @@ Description=nodeguard watchdog cycle (lifelines, canary, port refresh)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/nodeguard-watchdog
+# Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
+# /proc, and /sys writable, so the bpffs pin directory keeps working; it
+# is listed anyway as documentation and against a semantics change.
+# The systemctl, tailscaled, and journald calls are socket connects,
+# which a read-only mount permits.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOTE: the "-" prefix is mandatory, not style. The pin directory is
+# bpffs: it is gone after every reboot and recreated at runtime by
+# nodeguard-maps, and an unprefixed ReadWritePaths entry naming a path
+# that does not exist yet fails the unit at namespace setup
+# (status 226/NAMESPACE) before ExecStart ever runs.
+ReadWritePaths=/run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard
+# CAP_NET_RAW keeps the ping lifelines working on a host whose
+# ping_group_range sysctl is not permissive. CAP_DAC_OVERRIDE is for the
+# suricatasc call inside nodeguard-status: the Suricata command socket is
+# 0660 suricata:suricata on both gateways (measured 2026-09-06) and
+# connect(2) needs write permission on it, so without the capability the
+# snapshot silently drops ng.suricata_drops and ng.suricata_alerts
+# instead of failing the unit.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE
+# NOTE: bpf(2) sits in systemd's @privileged group, not @system-service,
+# so the status snapshot's bpftool calls need it named explicitly.
+SystemCallFilter=@system-service bpf

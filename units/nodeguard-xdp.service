@@ -9,6 +9,25 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/nodeguard-attach
 ExecStop=/usr/local/sbin/nodeguard-detach
+# Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
+# /proc, and /sys writable, so the bpffs pin directory keeps working; it
+# is listed anyway as documentation and against a semantics change.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOTE: the "-" prefix is mandatory, not style. The pin directory is
+# bpffs: it is gone after every reboot and recreated at runtime by
+# nodeguard-maps, and an unprefixed ReadWritePaths entry naming a path
+# that does not exist yet fails the unit at namespace setup
+# (status 226/NAMESPACE) before ExecStart ever runs.
+ReadWritePaths=/run/nodeguard -/sys/fs/bpf/nodeguard
+# CAP_PERFMON rides along because program load under the split-capability
+# model can demand it beside CAP_BPF and CAP_NET_ADMIN.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN CAP_PERFMON
+# NOTE: bpf(2) sits in systemd's @privileged group, not @system-service;
+# the loader additionally needs perf_event_open for program load.
+SystemCallFilter=@system-service bpf perf_event_open
 
 [Install]
 WantedBy=multi-user.target

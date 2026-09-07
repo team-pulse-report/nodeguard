@@ -7,6 +7,31 @@ Wants=suricata.service
 ExecStart=/usr/local/sbin/nodeguard-responder
 Restart=on-failure
 RestartSec=5
+# Hardening (evaluation finding S2). This daemon parses attacker-
+# influenced eve.json forever, so it is the unit the containment is
+# really for. ProtectSystem=strict leaves /dev, /proc, and /sys
+# writable, so the bpffs pin directory keeps working; it is listed
+# anyway as documentation and against a semantics change.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOTE: the "-" prefix is mandatory, not style. The pin directory is
+# bpffs: it is gone after every reboot and recreated at runtime by
+# nodeguard-maps, and an unprefixed ReadWritePaths entry naming a path
+# that does not exist yet fails the unit at namespace setup
+# (status 226/NAMESPACE) before ExecStart ever runs.
+ReadWritePaths=/run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard
+# CAP_DAC_READ_SEARCH is what lets the daemon reach its only input:
+# /var/log/suricata is 0750 suricata:suricata on both gateways (measured
+# 2026-09-06), and root without a DAC capability cannot traverse a
+# directory it neither owns nor shares a group with. Read-only traversal
+# is all this needs, so it is CAP_DAC_READ_SEARCH and not
+# CAP_DAC_OVERRIDE; eve.json itself is 0644.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_DAC_READ_SEARCH
+# NOTE: bpf(2) sits in systemd's @privileged group, not @system-service,
+# so the nodeguard-block and allow-dump subprocesses need it named.
+SystemCallFilter=@system-service bpf
 
 [Install]
 WantedBy=multi-user.target

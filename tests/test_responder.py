@@ -239,17 +239,16 @@ class GateTest(ResponderFixture):
         self.assertEqual(self.blocks, [])
 
     def test_gate_7_minute_cap_suppresses_new_blocks(self):
-        # Behavior finding S6 (change harden-nodeguard-control-plane,
-        # tasks 4.1 and 4.2) will change: a capped source that has no
-        # journal record yet will stop getting one. Update this test
-        # deliberately there rather than tripping over it.
+        # Finding S6: a capped source with no journal record gets none,
+        # because creating one is the inflation the storm buys for free.
+        # The suppression itself is exercised in test_responder_journal.
         st = self.state(ENFORCE="yes", RATE_MIN="1")
         self.feed(st, alert())
         out = self.feed(st, alert(src_ip=ATTACKER_2))
         self.assertIn("RATE CAP hit", out)
         self.assertEqual(self.blocks, [(ATTACKER, TTL_BASE)])
-        self.assertEqual(
-            st.journal.data[ATTACKER_2]["shadow_hits"], 1)
+        self.assertNotIn(ATTACKER_2, st.journal.data)
+        self.assertEqual(st.capped_suppressed, 1)
 
     def test_gate_7_hourly_distinct_cap_suppresses_new_blocks(self):
         st = self.state(ENFORCE="yes", RATE_HOUR="1")
@@ -329,9 +328,9 @@ class EscalationTest(ResponderFixture):
         self.assertEqual(shadow.journal.data[ATTACKER_2]["shadow_hits"], 1)
 
     def test_rate_caps_account_identically_in_both_modes(self):
-        # Behavior finding S6 (harden-nodeguard-control-plane) will
-        # debounce the journal save and stop creating a record for a
-        # previously unseen capped source; this assertion changes there.
+        # The caps themselves are mode-independent, and so is finding
+        # S6's record suppression: neither mode journals a previously
+        # unseen source while the cap is engaged.
         for enforce in ("yes", "no"):
             with self.subTest(enforce=enforce):
                 self.blocks = []
@@ -344,8 +343,8 @@ class EscalationTest(ResponderFixture):
                 out = self.feed(st, alert(src_ip=ATTACKER_2))
                 word = "RATE CAP" if enforce == "yes" else "WOULD RATE-CAP"
                 self.assertIn(f"{word} hit", out)
-                self.assertEqual(
-                    st.journal.data[ATTACKER_2]["shadow_hits"], 1)
+                self.assertNotIn(ATTACKER_2, st.journal.data)
+                self.assertEqual(st.capped_suppressed, 1)
                 self.assertEqual(len(st.minute), 1)
 
     def test_capped_episode_collapses_repeated_logging(self):

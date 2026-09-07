@@ -76,7 +76,10 @@ Concrete edits:
 2. bin/nodeguard-watchdog:15-17: target /run/nodeguard/nodeguard.kv;
    the existing chmod 0644 before mv stays (it is what makes the file
    agent-readable regardless of umask). The "[ -d /run/zabbix ]" guard
-   becomes "[ -d /run/nodeguard ]" (created at :10 anyway).
+   is dropped rather than repointed: it tested for the zabbix package's
+   own directory, and against /run/nodeguard, which the script's own
+   mkdir -p created two lines earlier, it can never be false. Keeping it
+   would leave a branch that reads as load-bearing and is not.
 3. bin/nodeguard-watchdog:23 and :27: the anomaly reader follows the
    new path.
 4. etc/zabbix-userparameter-nodeguard.conf:7 and :10: both
@@ -120,16 +123,17 @@ the per-unit directives.
 |---|---|---|---|
 | nodeguard-maps.service | ngmap.py create-maps/reconcile-allow (bpftool), getaddrinfo DNS resolve (bin/nodeguard-maps:38), tailscale debug derp-map (:47), ip route/addr, ng_log (bin/nodeguard-maps:35-103) | /sys/fs/bpf/nodeguard, /run/nodeguard (GEN file, bin/nodeguard-maps:22), /var/lib/nodeguard (cache truncation, :18) | network (DNS), /run/tailscale socket, dev-log socket (logger) |
 | nodeguard-xdp.service | nodeguard-attach / nodeguard-detach: xdp-loader load/unload/status, bpftool identity checks (bin/nodeguard-lib.sh:44-52, :80-127), ng_log | /sys/fs/bpf/nodeguard, /run/nodeguard (prog_id, expected_prog_id) | netlink, dev-log socket (logger) |
-| nodeguard-responder.service | tails eve.json, ngmap.py allow-dump and nodeguard-block (bpftool) via subprocess (bin/nodeguard-responder:135-137, :450) | /var/lib/nodeguard (blocks.json), /run/nodeguard (responder.kv, block.lock via ngmap.py:105) | nothing remote |
+| nodeguard-responder.service | tails /var/log/suricata/eve.json (bin/nodeguard-responder:86), which is 0644 suricata:suricata inside a 0750 suricata:suricata directory (measured on node-2 and node-3, 2026-09-06); ngmap.py allow-dump and nodeguard-block (bpftool) via subprocess (bin/nodeguard-responder:135-137, :450) | /var/lib/nodeguard (blocks.json), /run/nodeguard (responder.kv, block.lock via ngmap.py:105) | nothing remote |
 | nodeguard-feeds.service | https fetches (bin/nodeguard-feeds:150), ngmap.py map writes, systemctl start --no-block nodeguard-sweep (:871) | /var/lib/nodeguard/feeds, /sys/fs/bpf/nodeguard, /run/nodeguard (block.lock) | network, systemd control socket (/run/systemd/private, falling back to the dbus socket) |
 | nodeguard-sweep.service | ngmap.py sweep: bpftool dump/delete | /var/lib/nodeguard (mapstat.kv, sweep_hits.json, ngmap.py:43-44), /sys/fs/bpf/nodeguard, /run/nodeguard (block.lock) | nothing remote |
 | nodeguard-geo.service | bpftool map dump read-only (bin/nodeguard-geo:54-56) | /run/nodeguard (geo.kv, post move), /var/lib/nodeguard (attack-map.svg) | nothing remote |
-| nodeguard-watchdog.service | nodeguard-status (bpftool, xdp-loader status), ping probes (bin/nodeguard-watchdog:240, :273), tailscale status (:262), ss (bin/nodeguard-lib.sh:57-60), systemctl stop/start nodeguard-xdp (:222, :372), logger (bin/nodeguard-lib.sh:16) | /run/nodeguard (counters, kv export post move), /var/lib/nodeguard (wd_baseline.json, wd_anomaly.kv, bin/nodeguard-watchdog:28-29) | ICMP/UDP/TCP probes, /run/tailscale socket, systemd control socket, dev-log socket (logger) |
+| nodeguard-watchdog.service | nodeguard-status (bpftool, xdp-loader status, and suricatasc -c dump-counters against the 0660 suricata:suricata command socket, bin/nodeguard-status:76), ping probes (bin/nodeguard-watchdog:240, :273), tailscale status (:262), ss (bin/nodeguard-lib.sh:57-60), systemctl stop/start nodeguard-xdp (:222, :372), logger (bin/nodeguard-lib.sh:16) | /run/nodeguard (counters, kv export post move), /var/lib/nodeguard (wd_baseline.json, wd_anomaly.kv, bin/nodeguard-watchdog:28-29) | ICMP/UDP/TCP probes, /run/tailscale socket, systemd control socket, dev-log socket (logger) |
 | suricata-update.service | /usr/bin/suricata-update, suricatasc (units/suricata-update.service) | /var/lib/suricata; /var/lib/nodeguard once close-nodeguard-alerting-gaps adds its update stamp (see the table note below) | network, /run/suricata command socket |
+| nodeguard-allow-refresh.service | systemctl reload nodeguard-maps.service (units/nodeguard-allow-refresh.service) | nothing: the reload's work runs in nodeguard-maps.service's own context | systemd control socket |
 
 ### Directives
 
-Common block on all eight units:
+Common block on all nine units:
 
 ```
 NoNewPrivileges=yes
@@ -142,7 +146,15 @@ ProtectSystem=strict mounts the entire hierarchy read-only except
 /dev, /proc, and /sys, so /sys/fs/bpf stays writable without an
 exception; it is still listed in ReadWritePaths where used, as
 documentation and as robustness against a future ProtectSystem
-semantic change. Because /dev, /proc, and /sys stay writable, the
+semantic change. That listing carries systemd's "-" prefix, and the
+prefix is mandatory rather than stylistic: the pin directory sits on
+bpffs, so it is gone after every reboot and is recreated at runtime by
+nodeguard-maps itself (bin/ngmap.py:587). An unprefixed entry naming a
+path that does not exist fails the unit at namespace setup with status
+226/NAMESPACE, before ExecStart runs; on nodeguard-maps that would fail
+the very unit that creates the directory, take nodeguard-xdp down with
+it through Requires=, and leave the host running open with no datapath
+and no watchdog kv export. Because /dev, /proc, and /sys stay writable, the
 declared-paths guarantee is scoped to the persistent filesystem; the
 spec says so explicitly, and tightening the API filesystems further
 (ProtectKernelTunables, ProtectControlGroups, PrivateDevices) is
@@ -174,14 +186,32 @@ Per-unit ReadWritePaths:
 
 | Unit | ReadWritePaths |
 |---|---|
-| nodeguard-maps | /run/nodeguard /var/lib/nodeguard /sys/fs/bpf/nodeguard |
-| nodeguard-xdp | /run/nodeguard /sys/fs/bpf/nodeguard |
-| nodeguard-responder | /run/nodeguard /var/lib/nodeguard /sys/fs/bpf/nodeguard |
-| nodeguard-feeds | /run/nodeguard /var/lib/nodeguard /sys/fs/bpf/nodeguard |
-| nodeguard-sweep | /run/nodeguard /var/lib/nodeguard /sys/fs/bpf/nodeguard |
-| nodeguard-geo | /run/nodeguard /var/lib/nodeguard /sys/fs/bpf/nodeguard |
-| nodeguard-watchdog | /run/nodeguard /var/lib/nodeguard /sys/fs/bpf/nodeguard |
+| nodeguard-maps | /run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard |
+| nodeguard-xdp | /run/nodeguard -/sys/fs/bpf/nodeguard |
+| nodeguard-responder | /run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard |
+| nodeguard-feeds | /run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard |
+| nodeguard-sweep | /run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard |
+| nodeguard-geo | /run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard |
+| nodeguard-watchdog | /run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard |
 | suricata-update | /var/lib/suricata /var/lib/nodeguard |
+| nodeguard-allow-refresh | none (writes nothing of its own) |
+
+Table note, cross-change: nodeguard-allow-refresh.service is the ninth
+unit, added by fix-nodeguard-state-lifecycle, which landed before this
+change and deferred its hardening here. It carries the common block, an
+empty CapabilityBoundingSet, and @system-service with no bpf allowance,
+because asking systemd for a reload job is a socket connect that needs
+neither a capability nor a writable path; the reload itself executes
+under nodeguard-maps.service's directives.
+
+Table note, cross-change: deploy.sh's systemd-analyze verify loop
+(deploy/deploy.sh:149-155) enumerated units by hand and omitted
+nodeguard-geo.service and nodeguard-geo.timer, although install pushes
+every units/*.service (deploy/deploy.sh:59). That made the geo unit the
+one unit whose new hardening block would never be syntax-checked on the
+host, so the two names are added here. The manifest defect itself is
+fix-nodeguard-deploy-reliability's R2, which should reconcile the loop
+against the directory rather than against a longer hand list.
 
 Table note, cross-change: suricata-update's /var/lib/nodeguard entry
 exists for the suricata-update.stamp that close-nodeguard-alerting-gaps
@@ -207,24 +237,62 @@ CapabilityBoundingSet per unit:
 |---|---|
 | nodeguard-maps | CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN |
 | nodeguard-xdp | CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN CAP_PERFMON |
-| nodeguard-responder | CAP_SYS_ADMIN CAP_BPF |
+| nodeguard-responder | CAP_SYS_ADMIN CAP_BPF CAP_DAC_READ_SEARCH |
 | nodeguard-feeds | CAP_SYS_ADMIN CAP_BPF |
 | nodeguard-sweep | CAP_SYS_ADMIN CAP_BPF |
 | nodeguard-geo | CAP_SYS_ADMIN CAP_BPF |
-| nodeguard-watchdog | CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN CAP_NET_RAW |
+| nodeguard-watchdog | CAP_SYS_ADMIN CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE |
 | suricata-update | CAP_DAC_OVERRIDE |
+| nodeguard-allow-refresh | (empty) |
 
 Rationale for the outliers: nodeguard-xdp carries CAP_PERFMON because
 program load under the split-capability model can require it alongside
 CAP_BPF and CAP_NET_ADMIN; the watchdog carries CAP_NET_RAW so its ping
-probes work even where the ping_group_range sysctl is not permissive;
-suricata-update starts with CAP_DAC_OVERRIDE rather than the empty set
-its plain file-and-network work suggests, because on Fedora
-/var/lib/suricata and the /run/suricata command socket are
-suricata-owned, and root stripped of CAP_DAC_OVERRIDE cannot write a
-0755 directory it does not own or connect to a group-restricted
-socket. The ownership is verified on the hosts at rollout and the set
-is trimmed to empty only if an observed full cycle survives it.
+probes work even where the ping_group_range sysctl is not permissive.
+
+The three DAC entries are not defensive guesses; they were derived from
+the permissions measured on node-2 and node-3 on 2026-09-06, which are
+identical on both hosts:
+
+| Path | Mode | Owner |
+|---|---|---|
+| /var/log/suricata | 0750 | suricata:suricata |
+| /var/log/suricata/eve.json | 0644 | suricata:suricata |
+| /run/suricata/suricata-command.socket | 0660 | suricata:suricata |
+| /var/lib/suricata | 2770 | suricata:suricata |
+| /run/tailscale/tailscaled.sock | 0666 | root:root |
+| /run/systemd/private | 0700 | root:root |
+| /dev/log | 0777 | root:root |
+
+A bounding set caps a root process's permitted set at execve, so root
+inside these units has exactly the DAC capabilities the set names and
+no others. From the table:
+
+- nodeguard-responder gets CAP_DAC_READ_SEARCH. Its only input is
+  eve.json, and reaching it means traversing a 0750 directory the unit
+  neither owns nor shares a group with; without the capability follow()
+  fails with EACCES and the daemon crash-loops under Restart=on-failure
+  with enforcement dead. eve.json itself is 0644, so read-only traversal
+  is the whole requirement and CAP_DAC_OVERRIDE would be more than it
+  needs.
+- nodeguard-watchdog gets CAP_DAC_OVERRIDE. nodeguard-status connects to
+  the 0660 command socket for suricatasc -c dump-counters, and connect(2)
+  needs write permission on the socket inode. This failure is silent
+  rather than loud, which is why it is granted rather than left for the
+  rollout to discover: bin/nodeguard-status:71-73 omits BOTH
+  ng.suricata_drops and ng.suricata_alerts on any socket error, so the
+  keys would simply vanish from the per-minute snapshot on both gateways
+  with no unit failure and no error line.
+- suricata-update keeps CAP_DAC_OVERRIDE, and the measurement makes it
+  required rather than provisional: /var/lib/suricata is 2770
+  suricata:suricata (not the 0755 the first draft of this section
+  assumed), so root without the capability cannot even traverse it, and
+  the same command socket needs the same write permission.
+
+The sockets the other units reach need no DAC capability, which the same
+measurement establishes: tailscaled's socket is 0666, /dev/log is 0777,
+and /run/systemd/private is root-owned, so the systemctl, tailscale, and
+logger paths work under an empty DAC set.
 CAP_SYS_ADMIN dominating each set is acknowledged:
 these sets mainly document intent and cut the incidental capabilities
 (CAP_SYS_MODULE, CAP_SYS_RAWIO, CAP_MKNOD, CAP_SYS_BOOT, and the rest
@@ -232,7 +300,8 @@ of root's default set), which is where most of the defense-in-depth
 value is; NoNewPrivileges plus the syscall filter carry the remainder.
 
 SystemCallFilter: @system-service on every unit; units whose commands
-call bpf(2) (all except suricata-update) add bpf explicitly, and
+call bpf(2) (all except suricata-update and nodeguard-allow-refresh,
+neither of which touches a map) add bpf explicitly, and
 nodeguard-xdp also adds perf_event_open. bpf is in systemd's
 @privileged group and not in @system-service, hence the explicit
 allowance. The exact group membership on the deployed systemd version
@@ -262,7 +331,7 @@ aimed exactly there.
 Local verification is a unit-file conformance test (stdlib unittest)
 that parses every units/*.service file present and asserts the common
 hardening block on all of them, whatever their number, then asserts
-the two tables above for the eight units this change names. Asserting
+the two tables above for the nine units those tables name. Asserting
 the common block globally rather than against a frozen list matters
 across changes: fix-nodeguard-state-lifecycle adds
 nodeguard-allow-refresh.service and explicitly defers its hardening
@@ -360,7 +429,7 @@ change):
 - test_units.py: parses every units/*.service file present and asserts
   the common hardening block on all of them, then asserts the per-unit
   ReadWritePaths and CapabilityBoundingSet tables from section 2 for
-  the eight named units, so the design tables and the shipped units
+  every unit those tables name, so the design tables and the shipped units
   cannot drift and a unit added by another change cannot ship
   unhardened.
 - test_feeds_fetch.py: fetch() against a stub handler; a redirect

@@ -74,7 +74,7 @@ the link), 3 responder dry-run, 4 enforcement, 5 steady state.
 ## Monitoring
 
 The watchdog exports a `nodeguard-status --kv` snapshot to
-`/run/zabbix/nodeguard.kv` every minute; the Zabbix agent reads that file
+`/run/nodeguard/nodeguard.kv` every minute; the Zabbix agent reads that file
 through the shipped UserParameter (SELinux keeps the agent from calling
 `bpf()` itself), the template in `templates/` turns the keys into items
 and triggers, and three dashboards sit on top: Overview (attached,

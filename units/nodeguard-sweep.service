@@ -4,3 +4,20 @@ Description=nodeguard expired-block garbage collection
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 /usr/local/lib/nodeguard/ngmap.py sweep
+# Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
+# /proc, and /sys writable, so the bpffs pin directory keeps working; it
+# is listed anyway as documentation and against a semantics change.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOTE: the "-" prefix is mandatory, not style. The pin directory is
+# bpffs: it is gone after every reboot and recreated at runtime by
+# nodeguard-maps, and an unprefixed ReadWritePaths entry naming a path
+# that does not exist yet fails the unit at namespace setup
+# (status 226/NAMESPACE) before ExecStart ever runs.
+ReadWritePaths=/run/nodeguard /var/lib/nodeguard -/sys/fs/bpf/nodeguard
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF
+# NOTE: bpf(2) sits in systemd's @privileged group, not @system-service,
+# so the map dump and delete calls need it named explicitly.
+SystemCallFilter=@system-service bpf

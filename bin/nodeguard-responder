@@ -20,6 +20,11 @@ gate must update both.
   7. rate caps on new-block ATTEMPTS (30/min, 500 distinct/hour default),
      accounted identically in dry-run and enforce mode
 
+While gate 7's cap is engaged, an alert from a source with no journal
+record leaves the journal alone entirely: the source is not being blocked,
+so a record for it would be pure storm-driven growth. The suppressed
+creations are counted and reported when the capped episode ends.
+
 TTL escalation counts OFFENSES (block windows), not alert lines: while a
 source is inside its blocked_until window, further alerts refresh
 last_seen only. Windows belong to the boot they were written under and
@@ -33,6 +38,7 @@ import collections
 import ipaddress
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -43,6 +49,10 @@ NGMAP = "/usr/local/lib/nodeguard/ngmap.py"
 BLOCK = "/usr/local/sbin/nodeguard-block"
 ALLOW_CACHE_TTL = 60
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+# Serializing the journal is O(journal), so sightings are debounced onto
+# the same cadence as the kv flush below: during the storms the rate caps
+# exist for, every gate-passing line used to rewrite the whole file.
+JOURNAL_FLUSH_S = 15
 
 # INVARIANT: reserved top-level journal key, never an address. Journal
 # record keys are IP address strings, so this cannot collide with one.
@@ -191,6 +201,10 @@ class Journal:
         self.path = path
         self.boot = boot_id()
         self.data = {}
+        # Pending in-memory changes not yet serialized, and when the file
+        # was last written; both are set before any save can run.
+        self.dirty = False
+        self.last_flush = 0.0
         meta = None
         try:
             with open(path) as f:
@@ -255,6 +269,22 @@ class Journal:
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, self.path)
+        self.dirty = False
+        self.last_flush = time.time()
+
+    def flush(self, now, force=False):
+        """Persist pending sightings, at most once per JOURNAL_FLUSH_S.
+        force ignores the interval and is how shutdown drains the pending
+        state.
+        SAFETY: what a crash can lose here is bounded to one interval of
+        last_seen refreshes and shadow_hits, never an offense count and
+        never an enforced block; both of those save immediately, and the
+        30-day prune already discards far more."""
+        if not self.dirty:
+            return
+        if not force and now - self.last_flush < JOURNAL_FLUSH_S:
+            return
+        self.save()
 
     def _rec(self, ip):
         """Return (creating if needed) the mutable journal record for one IP."""
@@ -263,12 +293,13 @@ class Journal:
                  "first_seen": time.time()})
 
     def sighting(self, ip, sid):
-        """A non-offense observation (refresh, rate-capped, dry-run)."""
+        """A non-offense observation (refresh, rate-capped, dry-run).
+        Marks the journal dirty; the caller's flush writes it."""
         rec = self._rec(ip)
         rec["last_seen"] = time.time()
         rec["sid"] = sid
         rec["shadow_hits"] = rec.get("shadow_hits", 0) + 1
-        self.save()
+        self.dirty = True
         return rec
 
     def offense(self, ip, sid, ttl, shadow):
@@ -279,9 +310,15 @@ class Journal:
         rec["blocked_until"] = time.time() + ttl
         if shadow:
             rec["shadow_hits"] = rec.get("shadow_hits", 0) + 1
+            self.dirty = True
         else:
+            # SAFETY: a real offense count drives TTL escalation for a
+            # block the kernel is now enforcing, so it is persisted before
+            # the next event rather than debounced. There is at most one
+            # per accepted block and the minute cap already bounds those,
+            # so immediacy costs nothing during a storm.
             rec["count"] = rec.get("count", 0) + 1
-        self.save()
+            self.save()
         return rec
 
 
@@ -352,6 +389,7 @@ class EventState:
         self.minute = collections.deque()  # timestamps of new-block attempts
         self.hour_seen = {}                # ip -> first counted ts in the hour
         self.capped_episode = False
+        self.capped_suppressed = 0         # records not created while capped
         self.malformed = 0
         # security-event telemetry (design: monitoring chain 5g); flushed
         # at most every 15s so a burst does not turn into an fsync storm
@@ -472,15 +510,30 @@ def handle_event(line, st, now):
     new_hour_entry = src not in st.hour_seen
     if (len(st.minute) >= st.rate_min_cap
             or (new_hour_entry and len(st.hour_seen) >= st.rate_hour_cap)):
+        # INVARIANT: while the cap is engaged a source with no journal
+        # record gets none. Creating one is exactly the journal inflation
+        # an attacker earns for free during the storm the cap exists for,
+        # and the source is by definition not blocked; sources that
+        # already have a record keep refreshing.
+        if src in st.journal.data:
+            st.journal.sighting(src, sid)
+        else:
+            st.capped_suppressed += 1
         if not st.capped_episode:
             word = "RATE CAP" if st.enforce else "WOULD RATE-CAP"
             log(f"{word} hit ({len(st.minute)}/min, "
                 f"{len(st.hour_seen)}/h distinct); suppressing new "
-                f"blocks: {tag}")
+                f"blocks, {st.capped_suppressed} unseen source(s) not "
+                f"journaled: {tag}")
             st.capped_episode = True
-        st.journal.sighting(src, sid)
         return
-    st.capped_episode = False
+    if st.capped_episode:
+        # The episode's total is only knowable at its end, so it is
+        # reported here rather than in the line that opened the episode.
+        log(f"rate cap episode over; {st.capped_suppressed} unseen "
+            "source(s) were not journaled while it lasted")
+        st.capped_episode = False
+        st.capped_suppressed = 0
     st.minute.append(now)
     if new_hour_entry:
         st.hour_seen[src] = now
@@ -507,25 +560,32 @@ def handle_event(line, st, now):
         log(f"block FAILED ({err}): {tag}")
 
 
-def main():
-    """Tail eve.json forever and hand every line to handle_event, keeping the periodic housekeeping (prune, malformed reporting, sids reload, kv flush) around it; the responder's event loop."""
-    conf = load_conf()
-    st = make_state(conf)
-    sids_mtime = 0
-    try:
-        sids_mtime = os.stat(conf["SIDS"]).st_mtime
-    except FileNotFoundError:
-        pass
+def terminate(_signum, _frame):
+    """SIGTERM disposition: raise SystemExit so the event loop unwinds."""
+    raise SystemExit(0)
+
+
+def install_sigterm_handler():
+    """Make a systemd stop unwind the event loop instead of killing it.
+    SAFETY: nodeguard-responder.service sets no KillSignal, so systemctl
+    stop delivers SIGTERM, whose default Python disposition terminates the
+    process without running any finally clause; the debounced journal
+    state would be lost on every planned stop. Only SIGINT reaches the
+    KeyboardInterrupt handler, and systemd does not send it."""
+    signal.signal(signal.SIGTERM, terminate)
+
+
+def run_loop(conf, st, sids_mtime):
+    """The event loop proper: follow eve.json, run the periodic
+    housekeeping (prune, malformed reporting, sids reload, kv and journal
+    flushes), and drive every line through handle_event."""
     last_prune = time.time()
     last_malformed_report = time.time()
-
-    log(f"responder: started, ENFORCE={'yes' if st.enforce else 'no'}, "
-        f"{len(st.optin)} opt-in / {len(st.ignore)} ignored / "
-        f"{len(st.udp_ok)} udp-ok SIDs")
 
     for line in follow(conf["EVE"]):
         if line is None:
             st.flush_sec()
+            st.journal.flush(time.time())
             continue
         try:
             now = time.time()
@@ -549,6 +609,7 @@ def main():
                 pass
 
             handle_event(line, st, now)
+            st.journal.flush(now)
         except Exception as e:  # never let one event kill the tail
             st.malformed += 1
             if time.time() - last_malformed_report > 60:
@@ -556,6 +617,31 @@ def main():
                     f"({st.malformed} since last report)")
                 st.malformed = 0
                 last_malformed_report = time.time()
+
+
+def main():
+    """Build the daemon state, arm the shutdown path, and run the event
+    loop until something stops it; the responder's entry point."""
+    conf = load_conf()
+    st = make_state(conf)
+    install_sigterm_handler()
+    sids_mtime = 0
+    try:
+        sids_mtime = os.stat(conf["SIDS"]).st_mtime
+    except FileNotFoundError:
+        pass
+
+    log(f"responder: started, ENFORCE={'yes' if st.enforce else 'no'}, "
+        f"{len(st.optin)} opt-in / {len(st.ignore)} ignored / "
+        f"{len(st.udp_ok)} udp-ok SIDs")
+
+    try:
+        run_loop(conf, st, sids_mtime)
+    finally:
+        # SAFETY: whatever ends the loop (SIGTERM through terminate(),
+        # Ctrl-C, or an unhandled error), the sightings pending inside the
+        # debounce interval reach disk before the process goes away.
+        st.journal.flush(time.time(), force=True)
 
 
 if __name__ == "__main__":

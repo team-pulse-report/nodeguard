@@ -1,7 +1,7 @@
 #!/bin/bash
 # nodeguard-status: the 2am command. Human output by default; --kv emits
 # key=value pairs consumed by the monitoring chain (watchdog exports it
-# to /run/zabbix/nodeguard.kv every minute).
+# to /run/nodeguard/nodeguard.kv every minute).
 #
 # INVARIANT: the --kv path is O(1) in blocklist population. Trie walks
 # live in the 10-minute sweep, which is the SOLE writer of the mapstat
@@ -19,6 +19,7 @@ MAPSTAT=/var/lib/nodeguard/mapstat.kv
 RESP_KV=/run/nodeguard/responder.kv
 FEEDS_KV=/var/lib/nodeguard/feeds/feeds.kv
 ALLOW_KV=/run/nodeguard/allow.kv
+GEO_KV=/run/nodeguard/geo.kv
 
 kv=0
 [ "${1:-}" = "--kv" ] && kv=1
@@ -189,8 +190,8 @@ for k, v in d.items():
     fi
     # Attack-origin geoip enrichment (nodeguard-geo; fail-open, absent
     # until the first geo run and only if the DB is installed).
-    if [ -f /run/zabbix/geo.kv ]; then
-        cat /run/zabbix/geo.kv
+    if [ -f "$GEO_KV" ]; then
+        cat "$GEO_KV"
     fi
     # Feed loader state, persisted across reboot so staleness triggers
     # stay honest (a tmpfs fragment would false-alarm on every boot).

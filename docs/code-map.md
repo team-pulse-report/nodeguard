@@ -17,7 +17,7 @@ contract (ADR 0003).
   nodeguard-maps  ---> [ allow4/allow6 ]         drops or passes
   watchdog        ---> [ config, stats  ]
        |                                              |
-       +--> nodeguard-status --kv --> /run/zabbix --> Zabbix
+       +--> nodeguard-status --kv --> /run/nodeguard --> Zabbix
 ```
 
 ## The datapath (kernel)
@@ -134,7 +134,7 @@ datapath death, with bounded auto re-arm. Refreshes the WireGuard port.
 
 ### bin/nodeguard-status (the 2am command; --kv for monitoring)
 Human summary by default. `--kv` emits the full key/value snapshot the
-watchdog exports to /run/zabbix/nodeguard.kv; every value that cannot be
+watchdog exports to /run/nodeguard/nodeguard.kv; every value that cannot be
 read is omitted (visible-unknown), never zeroed.
 
 ### bin/nodeguard-canary
@@ -183,7 +183,10 @@ The stdlib unittest suite over the userspace control plane: `ngtest.py`
 (the harness: importlib loader for the extensionless `bin/` scripts, the
 extractor for the watchdog's embedded detector, and the fakes for every
 subprocess and transport boundary) plus `test_ngmap.py`,
-`test_feeds.py`, `test_responder.py`, and `test_watchdog_anom.py`.
+`test_feeds.py`, `test_responder.py`, and `test_watchdog_anom.py`, and
+the confinement-and-containment modules `test_units.py` (every shipped
+unit against the documented hardening tables), `test_geo_write.py`,
+`test_feeds_fetch.py`, and `test_responder_journal.py`.
 Hermetic by invariant: no root, no network, no bpftool, and no write
 outside a temporary directory, so it runs on any machine with python3.
 `deploy.sh` ships an explicit manifest, so the suite never reaches a

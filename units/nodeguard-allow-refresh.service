@@ -23,3 +23,14 @@ ExecStart=/usr/bin/systemctl reload nodeguard-maps.service
 # getaddrinfo and `tailscale debug derp-map` are the slow calls behind the
 # reload; a hung one must end as a failed job, not a stuck one.
 TimeoutStartSec=180
+# Hardening (evaluation finding S2). This unit only asks systemd for a
+# reload job over the control socket, which a read-only mount permits and
+# which needs no capability at all; the reload's own work runs in
+# nodeguard-maps.service's context under that unit's directives, so
+# nothing here is writable and no bpf(2) allowance belongs here.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

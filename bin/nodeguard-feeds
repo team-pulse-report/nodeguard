@@ -30,6 +30,11 @@ after a body passes every validation gate; a 200 that fails validation
 leaves the conditional-GET state untouched, so the next run re-fetches
 the full bad body and the failure keeps alarming instead of being
 masked by 304s against a broken upstream.
+
+SAFETY: bodies are accepted over https only, judged on the URL the fetch
+actually landed on rather than the one configured, so an upstream
+redirect into cleartext is discarded through the failed path instead of
+being parsed on an on-path attacker's behalf.
 """
 
 import argparse
@@ -55,6 +60,9 @@ APPROVED = f"{STATE_DIR}/approved.json"
 KV = f"{STATE_DIR}/feeds.kv"
 DIFF = f"{STATE_DIR}/last-diff.txt"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+# INVARIANT: the only scheme a feed body may arrive over, checked both on
+# the configured URL and on the URL urllib actually landed on.
+FEED_SCHEME = "https://"
 
 FEED_DEFS = {
     "spamhaus_drop_v4": {
@@ -140,6 +148,14 @@ def fetch(feed, meta, max_bytes):
     Return (status, body, hdrs). Side-effect free on meta: the caller
     persists conditional-GET state only after full validation."""
     d = FEED_DEFS[feed]
+    # SAFETY: a body carried in cleartext is refused rather than parsed,
+    # so an on-path attacker cannot add or withhold blocklist entries.
+    # Both refusals below use the failed:* contract, so the feed keeps its
+    # entries, withdraws nothing (invariant W1), persists no
+    # conditional-GET state, and alarms through the staleness triggers if
+    # the condition holds.
+    if not d["url"].startswith(FEED_SCHEME):
+        return f"failed:non-https feed url {d['url']}", None, {}
     req = urllib.request.Request(d["url"], headers={
         "User-Agent": "nodeguard-feeds/1.0"})
     if meta.get("etag"):
@@ -148,6 +164,12 @@ def fetch(feed, meta, max_bytes):
         req.add_header("If-Modified-Since", meta["last_modified"])
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
+            # NOTE: urllib's default handler chain follows redirects
+            # across schemes, so where the body really came from is only
+            # knowable from the final URL, after the open.
+            final = r.geturl()
+            if not final.startswith(FEED_SCHEME):
+                return f"failed:redirect to non-https url {final}", None, {}
             body = r.read(max_bytes + 1)
             if len(body) > max_bytes:
                 return f"failed:body over {max_bytes} byte cap", None, {}
