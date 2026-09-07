@@ -22,18 +22,48 @@ main branch.
   record build provenance"), and `close-nodeguard-alerting-gaps` ("Close
   alerting gaps with heartbeats, freshness stamps, triggers").
 
+### Build host verification
+
+- `build/build.sh` ran green end to end on two independent Fedora 44 x86_64
+  build hosts (2026-09-07, commit `911a81e`), against the base image pinned
+  by digest
+  `fedora@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80`:
+
+  ```
+  IMAGE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' fedora:44)"
+  docker run --rm --privileged -v "$PWD:/work" -e IMAGE_DIGEST="$IMAGE_DIGEST" \
+      fedora@"${IMAGE_DIGEST#*@}" /bin/bash /work/build/build.sh
+  ```
+
+  Every gate passed in one run: the new unit suite (185 tests) as the first
+  step, the kernel compile, the map spec generated from the object's BTF
+  (7 maps, `stats2` included), the netns pin/attach rehearsal (`rehearsal
+  PASSED`, sanity counters incrementing on all seven anomaly gates with
+  verdicts staying PASS, and the unreferenced-pin load/unload clean), the
+  per-host `suricata.yaml`, and the Zabbix template drift gate. Toolchain
+  recorded by the new provenance sidecar: clang 22.1.8, libbpf-devel 1.6.3,
+  libxdp-devel 1.6.3, xdp-tools 1.6.3, bpftool 7.6.0, kernel-headers 7.1.3,
+  all `.fc44.x86_64`.
+
+- Both hosts produced the identical object,
+  `92cc5c0e27b22568d05a7ee818c1190dccf8c336e7286d9dd08a15331931b0bc`, which
+  also matches the object built before this work; none of these five changes
+  touch `src/nodeguard_kern.c`, so an unchanged hash is the expected result,
+  and reproducing it on two machines is evidence the build is deterministic
+  in practice for a fixed source and toolchain. Determinism is still not a
+  guarantee across a toolchain bump: the buildinfo sidecar exists precisely
+  so a future difference is explainable rather than a mystery.
+
 ### Pending verification
 
-- Everything under Unreleased was implemented and verified on a macOS
-  workstation: the unit suite, `bash -n`, `shellcheck`, `py_compile`, the
-  Zabbix template drift gate, and `openspec validate --strict`. The
-  container-only gates have NOT run: `build/build.sh`'s kernel compile, BTF
-  map-spec generation, and netns attach rehearsal, plus the live
-  `systemd-analyze verify`, `suricata -T`, and `rpm` behaviour a real
-  `deploy/deploy.sh` run exercises. Run `build/build.sh` on a Fedora 44
-  x86_64 build host and re-read one full trace before deploying any of this
-  to a gateway; the hardened units in particular change namespace and
-  capability behaviour that only a live host can prove.
+- Still unproven, and it is the part that matters most before a gateway
+  deploy: the live `systemd-analyze verify`, `suricata -T`, and `rpm`
+  behaviour that only a real `deploy/deploy.sh` run against a host
+  exercises. The hardened units change namespace and capability behaviour
+  that no container build can prove; in particular a `ReadWritePaths` entry
+  naming a path that does not exist yet fails a unit at namespace setup
+  (status 226/NAMESPACE) before `ExecStart` runs. Deploy to one gateway
+  first and read the full unit status, not just the exit code.
 
 
 ### Added
