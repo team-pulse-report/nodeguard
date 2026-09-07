@@ -548,12 +548,21 @@ class Runner:
         # arms (entry symmetric difference AND covered-space delta). A
         # feed the operator just accepted via apply --confirm bypasses
         # the brake for exactly this run and is re-baselined on success.
-        pct = int(self.conf["FEEDS_MAX_CHURN_PCT"])
         for feed, desired in per_feed.items():
             base = self.feed_meta(feed).get("applied_cidrs")
             if base is None or feed in self.accepted \
                     or not self.enforcing(feed):
                 continue
+            # Per feed, defaulting to the global. A percentage has no
+            # resolution on a small baseline: dshield_top20 publishes the 19
+            # currently busiest attacking networks, so ordinary daily
+            # rotation moves ~68 percent of it and a 30 percent brake holds
+            # every run forever, while spamhaus_drop's thousands of
+            # slow-moving entries never approach the same number. One global
+            # threshold calibrates to feed size rather than to risk. Same
+            # override convention as FEEDS_MIN_/FEEDS_MAX_ above.
+            pct = int(self.conf.get(f"FEEDS_MAX_CHURN_PCT_{feed.upper()}",
+                                    self.conf["FEEDS_MAX_CHURN_PCT"]))
             bset = set(base)
             dset = set(desired.keys())
             delta_n = len(bset ^ dset)

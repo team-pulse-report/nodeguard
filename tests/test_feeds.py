@@ -447,6 +447,73 @@ class GateTest(RunnerFixture):
         self.assertEqual(list(per_feed[SPAMHAUS]), [SPAMHAUS_CIDR])
         self.assertEqual(per_feed[DSHIELD], {})
 
+    def churn_runner(self, **conf):
+        """A Runner with Spamhaus enforcing and a 10-entry applied baseline."""
+        runner = self.runner(**dict({"FEEDS_ENFORCE": "yes",
+                                     "FEEDS_APPLY": SPAMHAUS}, **conf))
+        runner.approved = {"feeds": [SPAMHAUS]}
+        runner.feed_meta(SPAMHAUS)["applied_cidrs"] = [
+            f"203.0.113.{n}/32" for n in range(10)]
+        return runner
+
+    def wholly_replaced(self):
+        """A desired set sharing no key with the baseline. Note this is 200
+        percent churn, not 100: the metric is the symmetric difference over
+        the baseline size, so every key removed AND every key added counts."""
+        return {SPAMHAUS: [(ipaddress.ip_network(f"198.51.100.{n}/32"), "r")
+                           for n in range(10)]}
+
+    def rotated(self, n):
+        """Baseline keys with n of the 10 swapped for new ones, which is the
+        shape of a real daily rotation: churn is 2n over 10."""
+        keep = [f"203.0.113.{i}/32" for i in range(n, 10)]
+        fresh = [f"198.51.100.{i}/32" for i in range(n)]
+        return {SPAMHAUS: [(ipaddress.ip_network(c), "r")
+                           for c in keep + fresh]}
+
+    def test_per_feed_override_lets_a_rotating_feed_through(self):
+        """dshield_top20 moves 13 of 19 entries daily, which is 137 percent by
+        this metric. A feed given a threshold above its normal movement must
+        not be held where the global default holds it."""
+        # 7 of 10 swapped is 14 over 10, or 140 percent by this metric.
+        default_run = self.churn_runner()
+        default_run.gate(self.rotated(7), [])
+        self.assertIn(SPAMHAUS, default_run.churn_held)
+
+        tuned = self.churn_runner(
+            **{f"FEEDS_MAX_CHURN_PCT_{SPAMHAUS.upper()}": "150"})
+        tuned.gate(self.rotated(7), [])
+        self.assertNotIn(SPAMHAUS, tuned.churn_held)
+
+    def test_absent_override_still_uses_the_global_default(self):
+        """The default path is untouched: no override means the old behaviour."""
+        runner = self.churn_runner()
+        runner.gate(self.wholly_replaced(), [])
+        self.assertIn(SPAMHAUS, runner.churn_held)
+
+    def test_override_applies_only_to_its_own_feed(self):
+        """A threshold on one feed must not raise another feed's."""
+        runner = self.churn_runner(
+            **{f"FEEDS_MAX_CHURN_PCT_{DSHIELD.upper()}": "100"})
+        runner.gate(self.wholly_replaced(), [])
+        self.assertIn(SPAMHAUS, runner.churn_held)
+
+    def test_malformed_override_fails_the_run(self):
+        """A typo must not silently fall back to the default."""
+        runner = self.churn_runner(
+            **{f"FEEDS_MAX_CHURN_PCT_{SPAMHAUS.upper()}": "thirty"})
+        with self.assertRaises(ValueError):
+            runner.gate(self.wholly_replaced(), [])
+
+    def test_hold_record_names_the_applied_threshold(self):
+        """An operator must be able to tell a tuned feed that still moved too
+        far from one that was never tuned."""
+        runner = self.churn_runner(
+            **{f"FEEDS_MAX_CHURN_PCT_{SPAMHAUS.upper()}": "40"})
+        runner.gate(self.wholly_replaced(), [])
+        self.assertIn(SPAMHAUS, runner.churn_held)
+        self.assertIn("exceeds 40 percent", "\n".join(runner.diff_lines))
+
     def test_churn_brake_holds_a_diverging_feed(self):
         runner = self.runner(**{"FEEDS_ENFORCE": "yes",
                                 "FEEDS_APPLY": SPAMHAUS})
