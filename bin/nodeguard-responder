@@ -35,6 +35,7 @@ accurate rehearsal of enforcement. Stdlib only; stdout goes to journald.
 """
 
 import collections
+import datetime
 import ipaddress
 import json
 import os
@@ -53,6 +54,14 @@ BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 # the same cadence as the kv flush below: during the storms the rate caps
 # exist for, every gate-passing line used to rewrite the whole file.
 JOURNAL_FLUSH_S = 15
+# The kv flush is debounced on the same reasoning; the heartbeat is the
+# longer interval at which the file is rewritten even with nothing new.
+# INVARIANT: a flush of either kind stamps ng.resp_kv_ts, so the exporter's
+# derived age distinguishes a quiet responder from a wedged one. Raising
+# KV_HEARTBEAT_S past the template's resp_kv_age threshold would make a
+# healthy idle responder page.
+KV_FLUSH_S = 15
+KV_HEARTBEAT_S = 60
 
 # INVARIANT: reserved top-level journal key, never an address. Journal
 # record keys are IP address strings, so this cannot collide with one.
@@ -342,6 +351,12 @@ def follow(path):
                 log(f"responder: following {path} (inode {inode})")
             except FileNotFoundError:
                 time.sleep(2)
+                # An absent eve.json (fresh boot, before Suricata creates
+                # it) is an ALIVE state, so the caller still gets the idle
+                # sentinel and the kv heartbeat keeps advancing; without
+                # this yield a responder behaving exactly as designed
+                # would trip the kv-age trigger.
+                yield None
                 continue
         line = f.readline()
         if line:
@@ -359,6 +374,26 @@ def follow(path):
             continue
         time.sleep(0.5)
         yield None  # idle sentinel: lets the caller flush pending state
+
+
+def eve_lag(stamp, now):
+    """Seconds between an EVE record's own timestamp and the moment it is
+    processed, or None when the record carries no usable one.
+    SAFETY: None is returned rather than a guess, so a malformed record
+    leaves the exported lag at its previous value instead of fabricating
+    one; a naive timestamp counts as unusable because .timestamp() would
+    read it as local time and manufacture a whole-timezone lag. A record
+    stamped ahead of this host's clock clamps to zero rather than
+    exporting a negative age."""
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return max(0, int(now - parsed.timestamp()))
 
 
 def block_via_wrapper(src, ttl):
@@ -392,25 +427,32 @@ class EventState:
         self.capped_suppressed = 0         # records not created while capped
         self.malformed = 0
         # security-event telemetry (design: monitoring chain 5g); flushed
-        # at most every 15s so a burst does not turn into an fsync storm
+        # on the KV_FLUSH_S / KV_HEARTBEAT_S cadence above
         self.sec = {"resp_alerts_seen": 0, "resp_blocks_issued": 0,
                     "resp_dryrun_would_block": 0, "resp_last_alert_ts": 0,
-                    "resp_last_action_ts": 0}
+                    "resp_last_action_ts": 0, "resp_lag_s": 0}
         self.sec_dirty = True
         self.sec_last_flush = 0.0
 
     def flush_sec(self):
-        """Write the security-telemetry kv file, rate-limited to at most once every 15s to avoid an fsync storm."""
-        if not self.sec_dirty or time.time() - self.sec_last_flush < 15:
+        """Write the security-telemetry kv file: at most once every
+        KV_FLUSH_S while values are changing, and at least once every
+        KV_HEARTBEAT_S while the event loop is alive, so an idle
+        responder still proves liveness without an fsync storm."""
+        now = time.time()
+        if now - self.sec_last_flush < KV_FLUSH_S:
+            return
+        if not self.sec_dirty and now - self.sec_last_flush < KV_HEARTBEAT_S:
             return
         try:
             os.makedirs(os.path.dirname(RESP_KV), exist_ok=True)
             with open(RESP_KV + ".tmp", "w") as f:
                 for k, v in self.sec.items():
                     f.write(f"ng.{k}={v}\n")
+                f.write(f"ng.resp_kv_ts={int(now)}\n")
             os.replace(RESP_KV + ".tmp", RESP_KV)
             self.sec_dirty = False
-            self.sec_last_flush = time.time()
+            self.sec_last_flush = now
         except OSError:
             pass
 
@@ -437,6 +479,9 @@ def handle_event(line, st, now):
         return
     st.sec["resp_alerts_seen"] += 1
     st.sec["resp_last_alert_ts"] = int(now)
+    lag = eve_lag(ev.get("timestamp"), now)
+    if lag is not None:
+        st.sec["resp_lag_s"] = lag
     st.sec_dirty = True
     st.flush_sec()
     alert = ev.get("alert") or {}

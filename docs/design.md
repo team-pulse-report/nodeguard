@@ -179,7 +179,7 @@ etc/                    shared config templates
 hosts/example-gateway/  per-host config template (documentation IPs)
 build/                  container build, spec generation, netns rehearsal
 deploy/                 file push and verify; enables nothing
-templates/              committed v1 Zabbix template JSON (kv items, triggers)
+templates/              generated Zabbix template JSON (kv items, triggers)
 zbx/                    template and dashboard generator suite from OpenSpec
                         change add-nodeguard-telemetry: gen-template.py
                         (v2 master/dependent template with uuid carry-over),
@@ -626,8 +626,11 @@ template turns the keys into items and triggers, including the
 triggers. The v2 template (generated deterministically by
 `zbx/gen-template.py`, gated by `zbx/check_template.py`, previewed as
 `zbx/preview-template-v2.json`; the committed
-`templates/zabbix-nodeguard-template.json` is the v1 baseline until the
-phase 2 import) reads the whole kv file through one master item,
+`templates/zabbix-nodeguard-template.json` is the generated v2 artifact,
+regenerated from the same run in the same commit as any generator edit,
+so importing it into the live server stays a human, scratch-rehearsed
+step and the committed file never diverges from the generator) reads the
+whole kv file through one master item,
 `nodeguard.kv.raw` (`etc/zabbix-userparameter-nodeguard.conf:10`);
 every other item is dependent on it with a `(?m)^ng\.<field>=(.+)$`
 extraction regex, so the agent polls once per minute instead of once

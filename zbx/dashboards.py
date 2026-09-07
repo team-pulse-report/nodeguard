@@ -249,8 +249,8 @@ def build_security(ctx):
         "Alert-to-block story: suricata alert rate vs responder "
         "decisions vs XDP drop rate (dry-run divergence reads directly)",
         ctx.datasets(["suricata alerts rate",
-                      "responder dry-run would-block",
-                      "responder blocks issued",
+                      "responder dry-run would-block rate",
+                      "responder blocks issued rate",
                       "nodeguard XDP drop rate v4",
                       "nodeguard XDP drop rate v6"]), refs))
     y += 8

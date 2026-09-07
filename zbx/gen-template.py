@@ -5,7 +5,7 @@
 Contract:
 - Deterministic: the same table and the same committed baseline always
   produce byte-identical output (json.dumps indent=1, no trailing newline,
-  matching the committed v1 formatting).
+  matching the committed baseline's formatting).
 - UUID carry-over: the COMMITTED templates/zabbix-nodeguard-template.json
   is loaded first and object-key-to-uuid maps are built (template group by
   name, template by name, items by key, triggers by name, discovery rules
@@ -14,17 +14,20 @@ Contract:
   but forced into UUIDv4 format (Zabbix rejects a raw uuid5 on import).
   This removes the delete-and-recreate risk (itemid churn, irreversible
   history loss) a full regeneration would invite.
-- Display names of items that exist in the committed v1 are reproduced
-  byte-for-byte (asserted by check_template.py): the dashboards address
-  svggraph datasets by item NAME pattern, so a rename would silently empty
-  every graph.
+- Display names of items that exist in the committed baseline are
+  reproduced byte-for-byte (asserted by check_template.py): the
+  dashboards address svggraph datasets by item NAME pattern, so a rename
+  would silently empty every graph.
 - v2 content: one master item (Zabbix agent, nodeguard.kv.raw, TEXT, 1m,
   history 1d, trends 0); every other item is DEPENDENT on it with a
   preprocessing regex '(?m)^ng\\.<field>=(.+)$' capture \\1; the new item,
   trigger, and LLD set from the add-nodeguard-telemetry design.
 - Output goes to zbx/preview-template-v2.json by default. The committed
-  template is NOT overwritten by this tool during review; pointing --out at
-  templates/ is a deliberate rollout step (phase 2).
+  templates/zabbix-nodeguard-template.json is regenerated from the SAME
+  run in the same commit as any edit to this file, so the generator and
+  the committed artifact cannot diverge and check_template.py's baseline
+  comparison stays meaningful. A designed removal is sanctioned in
+  zbx/removed-objects.txt in that same commit.
 
 Stdlib only. Reads the repo tree; writes only the --out file.
 """
@@ -44,10 +47,9 @@ TEMPLATE = "Nodeguard by Zabbix agent"
 TEMPLATE_GROUP = "Templates/Nodeguard"
 MASTER_KEY = "nodeguard.kv.raw"
 LLD_KEY = "nodeguard.feeds.discovery"
-FEEDS = ["spamhaus_drop_v4", "spamhaus_drop_v6", "dshield_top20"]
 
 # Fixed uuid5 namespace for newly minted objects. Deterministic by
-# construction; never used for objects that exist in the committed v1.
+# construction; never used for objects in the committed baseline.
 NODEGUARD_NS = uuid.uuid5(uuid.NAMESPACE_DNS, "nodeguard.zbx.template")
 
 
@@ -68,39 +70,50 @@ def rx(field):
     return "(?m)^ng\\.%s=(.+)$" % field
 
 
-def trig(name, expression, priority, description):
+def trig(name, expression, priority, description, depends_on=()):
     """Build one trigger definition dict (name, expression, priority,
-    description) for later rendering with a carried or minted uuid."""
+    description) for later rendering with a carried or minted uuid.
+    depends_on lists the trigger definitions this one is suppressed by;
+    Zabbix resolves a dependency by the master's NAME, so the same
+    definition object is reused rather than the name being retyped."""
     return {"name": name, "expression": expression,
-            "priority": priority, "description": description}
+            "priority": priority, "description": description,
+            "depends_on": list(depends_on)}
 
 
-def feed_triggers(feed):
-    """Return the two staleness triggers for one threat feed: a warning
-    after two missed refresh cycles and an average-severity failed-open
-    once its entries have decayed out of the kernel."""
-    succ = iref(kv_key("feeds_last_success_ts_%s" % feed))
-    return [
-        trig("nodeguard feed %s stale on {HOST.NAME}" % feed,
-             "last(%s)>0 and fuzzytime(%s,46800)=0" % (succ, succ),
-             "WARNING",
-             "Two full cycles plus margin without a successful exchange."),
-        trig("nodeguard feed %s failed open on {HOST.NAME}" % feed,
-             "last(%s)>0 and fuzzytime(%s,93600)=0" % (succ, succ),
-             "AVERAGE",
-             "Entries for this feed have expired in-kernel; designed "
-             "decay, not an outage."),
-    ]
+# The one trigger that names the actual failure when the whole kv export
+# chain dies. The no-data warnings below declare it as their dependency
+# so a dead chain pages once instead of four times (evaluation finding
+# O7); it is rendered exactly once, on the ts row.
+# MECHANISM: the nodata half is load-bearing, not belt-and-braces. Zabbix
+# recalculates a trigger only when a new value arrives for one of its
+# items, plus every 30s if the expression uses nodata() or a date/time
+# function; fuzzytime() is a history function and is in neither set. A
+# fuzzytime-only master could therefore never leave OK once values stop,
+# which is exactly the wiped-runtime-directory case its dependents were
+# added to suppress, and the operator would still get the three warnings
+# and no High.
+FROZEN_KV_TRIGGER = trig(
+    "nodeguard telemetry clock skew or frozen kv on {HOST.NAME}",
+    "fuzzytime(%s,300)=0 or nodata(%s,10m)=1"
+    % (iref(kv_key("ts")), iref(kv_key("ts"))), "HIGH",
+    "The kv timestamp is more than 5 minutes from server time, or no kv "
+    "value has arrived for 10 minutes: a frozen but still-served kv "
+    "file, host clock skew, or a dead export chain. The nodata half also "
+    "makes the trigger time-recalculated, which is what lets it fire, "
+    "and suppress its dependents, when values stop arriving entirely.")
 
-
-def feed_frozen_trigger(feed):
-    """Return the trigger that warns when a feed's upstream content has not
-    changed in 7 days (a stalled source, ahead of the 14-day hard stop)."""
-    age = iref(kv_key("feeds_snapshot_age_%s" % feed))
-    return trig("nodeguard feed %s upstream frozen on {HOST.NAME}" % feed,
-                "last(%s)>604800" % age, "WARNING",
-                "Upstream unchanged for 7 days; re-stamp hard-stops at "
-                "14 days.")
+# The trigger that names the fault when the responder unit itself is
+# down. The heartbeat-age and not-consuming warnings declare it as their
+# dependency: responder.kv lives on tmpfs and survives the stop, so a
+# stopped unit ages the heartbeat out AND stops consuming alerts, and all
+# three warnings describe one fault. Suppressed by this master, the two
+# dependents keep their real value, which is the unit that is active but
+# wedged (finding O7's page-once rule, applied to the responder).
+RESPONDER_DOWN_TRIGGER = trig(
+    "nodeguard responder is not active on {HOST.NAME}",
+    "last(%s)<>\"active\"" % iref(kv_key("responder")), "WARNING",
+    "no NEW blocks while down; existing blocks expire in-kernel")
 
 
 def row(field, name, vt, desc, units=None, history="31d", trends="180d",
@@ -146,7 +159,8 @@ def build_rows():
                      "nodata(%s,10m)=1" % iref(kv_key("attach_state")),
                      "WARNING",
                      "The watchdog export or the agent path is dead; "
-                     "nodeguard state unknown to monitoring."),
+                     "nodeguard state unknown to monitoring.",
+                     depends_on=[FROZEN_KV_TRIGGER]),
             ]),
         row("killswitch", "nodeguard kill switch", "UNSIGNED",
             "nonzero = enforcement soft-off (latched)",
@@ -179,13 +193,7 @@ def build_rows():
             ]),
         row("responder", "nodeguard responder unit state", "TEXT",
             "systemd is-active for nodeguard-responder", trends="0",
-            triggers=[
-                trig("nodeguard responder is not active on {HOST.NAME}",
-                     "last(%s)<>\"active\"" % iref(kv_key("responder")),
-                     "WARNING",
-                     "no NEW blocks while down; existing blocks expire "
-                     "in-kernel"),
-            ]),
+            triggers=[RESPONDER_DOWN_TRIGGER]),
         row("kernel_drops", "suricata kernel drops", "UNSIGNED",
             "cumulative af-packet kernel_drops across capture threads",
             triggers=[
@@ -239,7 +247,20 @@ def build_rows():
                      "ramps the baseline family cannot catch."),
             ]),
         row("pass", "nodeguard XDP pass rate", "FLOAT",
-            "default-pass packets per second", units="pps", rate=True),
+            "default-pass packets per second", units="pps", rate=True,
+            triggers=[
+                trig("nodeguard XDP counters are not arriving on "
+                     "{HOST.NAME}",
+                     "nodata(%s,10m)=1" % iref(kv_key("pass")),
+                     "WARNING",
+                     "No counter value for 10 minutes, so the counters "
+                     "are unsupported rather than zero. Split out of the "
+                     "stats-unreadable trigger because only this half is "
+                     "a symptom of the export chain dying; combined, the "
+                     "frozen-kv dependency would have suppressed a real "
+                     "read failure whenever the clock skewed.",
+                     depends_on=[FROZEN_KV_TRIGGER]),
+            ]),
         row("pass_allowlist", "nodeguard allowlist pass rate", "FLOAT",
             "allowlist hits per second", units="pps", rate=True),
         row("pass_wgport", "nodeguard WireGuard pass rate", "FLOAT",
@@ -263,7 +284,16 @@ def build_rows():
                      "hosts/<host>/feeds.conf and redeploy."),
             ]),
         row("feeds_journal_reset", "feeds journal reset", "UNSIGNED",
-            "1 = state.json was lost and rebuilt insert-only this run"),
+            "1 = state.json was lost and rebuilt insert-only this run",
+            triggers=[
+                trig("nodeguard feeds journal was lost on {HOST.NAME}",
+                     "last(%s)=1" % iref(kv_key("feeds_journal_reset")),
+                     "WARNING",
+                     "The CAS journal was lost and rebuilt insert-only, "
+                     "so this run owns no prior entries and cannot "
+                     "withdraw them; incident-relevant the moment it is "
+                     "reported, not after a window."),
+            ]),
         row("feeds_churn_held", "feeds churn held", "UNSIGNED",
             "1 = a feed's composition jumped past the churn brake",
             triggers=[
@@ -312,39 +342,43 @@ def build_rows():
             "UNSIGNED",
             "min over configured feeds of the last successful exchange"),
     ]
-    for feed in FEEDS:
-        rows.append(
-            row("feeds_last_success_ts_%s" % feed,
-                "feeds %s last success" % feed, "UNSIGNED",
-                "epoch of %s's last successful HTTP exchange" % feed,
-                triggers=feed_triggers(feed)))
-        rows.append(
-            row("feeds_snapshot_age_%s" % feed,
-                "feeds %s snapshot age" % feed, "UNSIGNED",
-                "seconds since %s's content last changed" % feed,
-                triggers=[feed_frozen_trigger(feed)]))
+    # The static per-feed items and their nine triggers were retired here
+    # in favour of the discovery prototypes below, and sanctioned in
+    # zbx/removed-objects.txt in the same commit; the per-feed kv keys
+    # they read are unchanged and now feed the LLD rule only.
     rows.append(
         row("feeds_map_errors", "feeds map errors", "UNSIGNED",
             "per-key bpftool failures this run (one lost key each, never "
-            "a lost batch)"))
+            "a lost batch)",
+            triggers=[
+                trig("nodeguard feeds map writes failing on {HOST.NAME}",
+                     "min(%s,13h)>0" % iref(kv_key("feeds_map_errors")),
+                     "WARNING",
+                     "Per-key map writes have failed across two full feed "
+                     "cycles plus margin: the loader is not a one-off "
+                     "blip short of entries, it is persistently unable to "
+                     "write them."),
+            ]))
 
     # --- new in v2 --------------------------------------------------------
     rows += [
         row("ts", "nodeguard kv timestamp", "UNSIGNED",
             "epoch stamped by the exporter at the top of the kv file",
-            units="unixtime",
-            triggers=[
-                trig("nodeguard telemetry clock skew or frozen kv on "
-                     "{HOST.NAME}",
-                     "fuzzytime(%s,300)=0" % iref(kv_key("ts")), "HIGH",
-                     "The kv timestamp is more than 5 minutes from server "
-                     "time: a frozen but still-served kv file or host "
-                     "clock skew. Complements the nodata trigger, which "
-                     "only catches the file not arriving at all."),
-            ]),
+            units="unixtime", triggers=[FROZEN_KV_TRIGGER]),
         row("stats_read_fail", "nodeguard stats read failure", "UNSIGNED",
             "1 = the stats pin exists but the dump or parse failed; the "
-            "counter keys are omitted rather than served as zeros"),
+            "counter keys are omitted rather than served as zeros",
+            triggers=[
+                trig("nodeguard stats unreadable on {HOST.NAME}",
+                     "last(%s)=1" % iref(kv_key("stats_read_fail")),
+                     "WARNING",
+                     "stats_read_fail=1: the stats pin exists but the "
+                     "dump or the parse failed, so the XDP counters are "
+                     "unknown, not zero. Value-based and independent of "
+                     "the export chain, so it carries no dependency; a "
+                     "fresh kv that reports its own counters unreadable "
+                     "has to page on its own."),
+            ]),
         row("stats2_read_fail", "nodeguard stats2 read failure",
             "UNSIGNED",
             "1 = the stats2 pin exists but the dump or parse failed; the "
@@ -358,7 +392,21 @@ def build_rows():
             ]),
         row("pass_expired", "nodeguard expired pass rate", "FLOAT",
             "packets per second passed because their block entry had "
-            "expired in-kernel", units="pps", rate=True),
+            "expired in-kernel", units="pps", rate=True,
+            triggers=[
+                trig("nodeguard expired entries are outliving the sweep "
+                     "on {HOST.NAME}",
+                     "min(%s,15m)>0" % iref(kv_key("pass_expired")),
+                     "WARNING",
+                     "Strictly positive on every sample for longer than a "
+                     "full 10-minute sweep period plus margin: corpses "
+                     "are being created faster than the sweep deletes "
+                     "them, or the sweep is not deleting them at all. An "
+                     "expired more-specific entry shadows the live "
+                     "broader block that covers it until the sweep runs "
+                     "(kernel finding K2). Placeholder window; brief "
+                     "blips at normal TTL expiry cannot trip a min()."),
+            ]),
         row("pass_nonip", "nodeguard non-IP pass rate", "FLOAT",
             "non-IP ethertype passes per second", units="pps", rate=True),
         row("pass_parsefail", "nodeguard parse-fail pass rate", "FLOAT",
@@ -441,14 +489,45 @@ def build_rows():
         rate_twin("kernel_drops", "suricata kernel drop rate",
                   "capture-ring drops per second (rate twin of the "
                   "cumulative counter, fixing the raw-cumulative plot)"),
+        row("suricata_update_ts", "suricata ruleset last update",
+            "UNSIGNED",
+            "epoch of the last SUCCESSFUL suricata-update, from the stamp "
+            "the unit's success-gated ExecStartPost writes; absent until "
+            "one has succeeded", units="unixtime",
+            triggers=[
+                trig("suricata ruleset update failing on {HOST.NAME}",
+                     "last(%s)>0 and fuzzytime(%s,180000)=0"
+                     % (iref(kv_key("suricata_update_ts")),
+                        iref(kv_key("suricata_update_ts"))),
+                     "WARNING",
+                     "Two daily cycles plus the timer's randomized-delay "
+                     "hour without a successful update. Every automated "
+                     "block is driven by the et/open severity-1 rules, so "
+                     "a chronically failing update is an enforcement gap "
+                     "nothing else reports."),
+            ]),
+        row("suricata_rules_mtime", "suricata rules file mtime",
+            "UNSIGNED",
+            "mtime of the rules file suricata actually loads; the "
+            "untriggered companion that says whether a successful update "
+            "changed anything on disk", units="unixtime"),
         row("resp_alerts_seen", "responder alerts seen", "UNSIGNED",
             "cumulative EVE alerts the responder has consumed"),
         row("resp_blocks_issued", "responder blocks issued", "UNSIGNED",
             "cumulative blocks the responder has written to the maps"),
+        rate_twin("resp_blocks_issued", "responder blocks issued rate",
+                  "blocks written to the maps per second (rate twin; the "
+                  "alert-to-block graph plots this, because a monotonic "
+                  "line flattens the per-second series beside it)"),
         row("resp_dryrun_would_block", "responder dry-run would-block",
             "UNSIGNED",
             "cumulative blocks the responder would have issued while in "
             "dry-run"),
+        rate_twin("resp_dryrun_would_block",
+                  "responder dry-run would-block rate",
+                  "would-be blocks per second (rate twin; the dry-run "
+                  "divergence the graph exists to show only reads against "
+                  "the issued-block rate)"),
         row("resp_last_alert_ts", "responder last alert time", "UNSIGNED",
             "epoch of the last alert the responder consumed",
             units="unixtime"),
@@ -456,6 +535,29 @@ def build_rows():
             "UNSIGNED",
             "epoch of the responder's last block or dry-run decision",
             units="unixtime"),
+        row("resp_kv_age", "nodeguard responder heartbeat age", "UNSIGNED",
+            "seconds since the responder last rewrote its kv file; it "
+            "rewrites at least once a minute while its event loop is "
+            "alive, so this separates quiet from wedged", units="s",
+            triggers=[
+                trig("nodeguard responder heartbeat stopped on "
+                     "{HOST.NAME}",
+                     "last(%s)>120" % iref(kv_key("resp_kv_age")),
+                     "WARNING",
+                     "Two missed heartbeats plus poll jitter. The unit "
+                     "can stay active while the event loop is wedged, in "
+                     "which case the last kv values are served forever; "
+                     "this is the only signal that says so. It carries "
+                     "no dependency on the frozen-kv trigger (a wedged "
+                     "responder is independent of the export chain), "
+                     "only on the unit-down trigger, which is the same "
+                     "fault reported one layer down.",
+                     depends_on=[RESPONDER_DOWN_TRIGGER]),
+            ]),
+        row("resp_lag_s", "nodeguard responder alert lag", "UNSIGNED",
+            "seconds between an EVE record's own timestamp and the "
+            "responder processing it; deliberately untriggered, the point "
+            "is that the lag is measured at all", units="s"),
         row("geo_summary", "attacker geography summary", "CHAR",
             "top attacker countries and hit counts (nodeguard-geo), e.g. "
             "NL:272 US:131; empty until the geoip index is installed"),
@@ -465,6 +567,18 @@ def build_rows():
             "of the hitting sources, how many resolved to a country"),
         row("geo_countries", "attacker countries", "UNSIGNED",
             "distinct countries among the geolocated attacker sources"),
+        row("geo_age", "attacker geography age", "UNSIGNED",
+            "seconds since the last SUCCESSFUL geo run; the run swallows "
+            "its failures and exits zero, so nothing else distinguishes "
+            "a live picture from a week-old one", units="s",
+            triggers=[
+                trig("nodeguard attacker geography is stale on "
+                     "{HOST.NAME}",
+                     "last(%s)>1800" % iref(kv_key("geo_age")), "WARNING",
+                     "Six 5-minute timer periods without a successful "
+                     "run, generous against timer jitter. Value-based, so "
+                     "it carries no dependency on the frozen-kv trigger."),
+            ]),
         row("top_blocked_1", "top blocked source #1", "CHAR",
             "rank 1 blocked source by hits since the last sweep walk"),
         row("top_blocked_2", "top blocked source #2", "CHAR",
@@ -637,21 +751,16 @@ def build_rows():
 def build_multi_item_triggers():
     """Return the triggers whose expressions span more than one item, so
     they are attached at the export's top level rather than to any single
-    item (for example stats unreadable, degraded attach mode)."""
+    item (for example degraded attach mode, responder divergence)."""
     return [
-        trig("nodeguard stats unreadable on {HOST.NAME}",
-             "last(%s)=1 or nodata(%s,10m)=1"
-             % (iref(kv_key("stats_read_fail")), iref(kv_key("pass"))),
-             "WARNING",
-             "stats_read_fail=1 or the counters are unsupported; XDP "
-             "counters are unknown, not zero."),
         trig("suricata alive but counters unreadable on {HOST.NAME}",
              "nodata(%s,10m)=1 and last(%s)=\"active\""
              % (iref(kv_key("kernel_drops")), iref(kv_key("suricata"))),
              "WARNING",
              "Live unit, dead socket: suricata reports active but "
              "kernel_drops is unsupported, which ng.suricata alone "
-             "cannot catch."),
+             "cannot catch.",
+             depends_on=[FROZEN_KV_TRIGGER]),
         trig("nodeguard attached in degraded mode on {HOST.NAME}",
              "last(%s)<>\"native\" and last(%s)=\"attached\""
              % (iref(kv_key("attach_mode")), iref(kv_key("attach_state"))),
@@ -676,6 +785,20 @@ def build_multi_item_triggers():
              "Dry-run would-block is rising while issued blocks are "
              "flat: the responder wants to act and is configured not "
              "to."),
+        trig("nodeguard responder is not consuming alerts on {HOST.NAME}",
+             "(last(%s)-last(%s,#10))>0 and (last(%s)-last(%s,#10))=0"
+             % (iref(kv_key("suricata_alerts")),
+                iref(kv_key("suricata_alerts")),
+                iref(kv_key("resp_alerts_seen")),
+                iref(kv_key("resp_alerts_seen"))),
+             "WARNING",
+             "Suricata's alert counter is rising across the window while "
+             "the responder's consumed count is flat: it is following the "
+             "wrong file, or its tail is stuck. The heartbeat alone "
+             "cannot see this, because a responder in this state is "
+             "alive and still flushing. Suppressed while the unit is "
+             "down, where it would only restate that fault.",
+             depends_on=[RESPONDER_DOWN_TRIGGER]),
     ]
 
 
@@ -705,8 +828,9 @@ def build_discovery_rule():
             "Discovers configured feed names from the "
             "feeds_last_success_ts_* keys in the kv export (excluding "
             "the _min aggregate). Prototype keys are distinct from the "
-            "static per-feed keys so discovery never collides with them "
-            "during the parity window.",
+            "retired static per-feed keys, so discovery never collided "
+            "with them during the parity window that preceded their "
+            "removal.",
         "lifetime": "30d",
         "preprocessing": [
             {"type": "JAVASCRIPT", "parameters": [LLD_JS]},
@@ -741,25 +865,23 @@ def build_discovery_rule():
                  "{HOST.NAME}",
                  "last(%s)>0 and fuzzytime(%s,46800)=0 and "
                  "nodata(%s,2h)=0" % (succ, succ, succ),
-                 "INFO",
+                 "WARNING",
                  "Two full cycles plus margin without a successful "
-                 "exchange. Information severity during the parity "
-                 "window; the nodata guard silences a feed removed from "
+                 "exchange. The nodata guard silences a feed removed from "
                  "feeds.conf once discovery drops it."),
             trig("nodeguard feed {#FEED} failed open (discovered) on "
                  "{HOST.NAME}",
                  "last(%s)>0 and fuzzytime(%s,93600)=0 and "
                  "nodata(%s,2h)=0" % (succ, succ, succ),
-                 "INFO",
+                 "AVERAGE",
                  "Entries for this feed have expired in-kernel; designed "
-                 "decay, not an outage. Information severity during the "
-                 "parity window; nodata-guarded."),
+                 "decay, not an outage. Nodata-guarded."),
             trig("nodeguard feed {#FEED} upstream frozen (discovered) on "
                  "{HOST.NAME}",
                  "last(%s)>604800 and nodata(%s,2h)=0" % (age, age),
-                 "INFO",
-                 "Upstream unchanged for 7 days. Information severity "
-                 "during the parity window; nodata-guarded."),
+                 "WARNING",
+                 "Upstream unchanged for 7 days; re-stamp hard-stops at "
+                 "14 days. Nodata-guarded."),
         ],
     }
 
@@ -769,7 +891,7 @@ def build_discovery_rule():
 # ---------------------------------------------------------------------------
 
 def load_uuid_maps(committed_path):
-    """Read the committed v1 template and index every existing object's uuid
+    """Read the committed baseline template and index every object's uuid
     by its natural key (groups and templates by name, items by key, triggers
     by name, discovery rules and prototypes), so the render can carry each
     uuid over verbatim."""
@@ -821,14 +943,23 @@ def make_uuid(maps, kind, mapname, obj_key):
 
 def render_trigger(maps, t, mapname="triggers", kind="trigger"):
     """Render one trigger definition into its export dict, attaching the
-    carried-over or newly minted uuid."""
-    return {
+    carried-over or newly minted uuid and, where declared, the
+    dependencies array. A dependency entry carries the master trigger's
+    name and expression only: import resolves it by that name reference,
+    so the wiring survives regeneration as long as the name is stable,
+    which uuid carry-over already guarantees."""
+    d = {
         "uuid": make_uuid(maps, kind, mapname, t["name"]),
         "name": t["name"],
         "expression": t["expression"],
         "priority": t["priority"],
         "description": t["description"],
     }
+    if t["depends_on"]:
+        d["dependencies"] = [{"name": dep["name"],
+                              "expression": dep["expression"]}
+                             for dep in t["depends_on"]]
+    return d
 
 
 def render_item(maps, r):
@@ -924,7 +1055,7 @@ def render(committed_path):
     """Assemble the complete v2 zabbix_export dict: template group,
     template with its master item, all dependent items, the discovery rule,
     and the top-level multi-item triggers, every uuid carried from the
-    committed v1 where the object already existed."""
+    committed baseline where the object already existed."""
     maps = load_uuid_maps(committed_path)
     items = [render_master(maps)]
     items += [render_item(maps, r) for r in build_rows()]
@@ -970,13 +1101,13 @@ def main():
                     "deterministically, carrying every committed uuid "
                     "over verbatim.")
     ap.add_argument("--committed", default=COMMITTED,
-                    help="committed v1 template JSON to carry uuids from "
-                         "(default: templates/zabbix-nodeguard-"
-                         "template.json)")
+                    help="committed baseline template JSON to carry "
+                         "uuids from (default: templates/zabbix-"
+                         "nodeguard-template.json)")
     ap.add_argument("--out", default=DEFAULT_OUT,
                     help="output path (default: zbx/preview-template-"
-                         "v2.json; pointing this at templates/ is a "
-                         "deliberate rollout step, not a review step)")
+                         "v2.json; the committed template is regenerated "
+                         "from the same run in the same commit)")
     args = ap.parse_args()
 
     if not os.path.exists(args.committed):

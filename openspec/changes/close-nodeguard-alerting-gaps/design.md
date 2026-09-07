@@ -192,6 +192,13 @@ produce geo.kv (the empty-result path writes it), so the age key
 exists wherever the timer runs; a host where geo has never run omits
 everything, visibly.
 
+Ordering, from the adversarial review: the stamp has to be the last
+artifact of the run. Written before the attack-map SVG, a run that
+failed only in render_svg or the map write would already have advanced
+the freshness stamp, leaving geo_age green over a frozen map. The map
+is therefore rendered and published first and the stamped kv write
+last, so any failure in either half ages the whole run out.
+
 The S1 finding (root writing into zabbix-owned /run/zabbix) is real
 and untouched here; the geo.kv path move belongs to the security
 change and only the file's content changes in this one.
@@ -217,8 +224,42 @@ trigger already funnels through render_trigger, so this is the single
 change point the finding identified. The three nodata-based warnings
 above declare the frozen-kv HIGH as their dependency. Value-based
 warnings (stats_read_fail=1 with a fresh kv, resp_kv_age, geo_age) get
-no dependency: they represent independent failures and must keep
-paging on their own.
+no dependency on it: they represent failures independent of the export
+chain and must keep paging on their own.
+
+Three corrections from the adversarial review of the implementation,
+all applied:
+
+1. The master has to be able to fire in the state it suppresses for.
+   Zabbix recalculates a trigger only when a new value arrives for one
+   of its items, plus every 30 seconds when the expression uses
+   nodata() or a date/time function (verified against the current
+   Zabbix documentation). fuzzytime() is a history function and is in
+   neither set, so a fuzzytime-only master could enter PROBLEM only
+   while values were still arriving: with /run/nodeguard wiped the
+   master would stay OK and all three dependents would fire, which is
+   exactly the outcome the dependency exists to prevent. The master
+   expression is therefore
+   `fuzzytime(ts,300)=0 or nodata(ts,10m)=1`, which both covers the
+   dead-chain case and makes the whole trigger timer-recalculated.
+2. A trigger that mixes a value clause with a nodata clause cannot
+   carry the dependency without suppressing its value half. "nodeguard
+   stats unreadable" was `last(stats_read_fail)=1 or
+   nodata(pass,10m)=1`, so a real stats-pin read failure would have
+   been suppressed whenever the master was in PROBLEM (clock skew past
+   5 minutes is enough). It is split: "nodeguard stats unreadable"
+   keeps the value clause and no dependency, and a new "nodeguard XDP
+   counters are not arriving" carries the nodata clause and the
+   dependency. No object is removed, so no sanction is involved; the
+   trigger count rises by one.
+3. Page-once applies to the responder too. A stopped responder unit
+   raises the pre-existing "responder is not active" WARNING, and,
+   because responder.kv lives on tmpfs and survives the stop, also the
+   new heartbeat-age WARNING and (while Suricata keeps alerting) the
+   not-consuming WARNING: three warnings for one fault. The unit-down
+   trigger is hoisted to a module constant and declared as the master
+   of the other two, which keeps their real value, the unit that is
+   active but wedged.
 
 ## 8. Expired-pass-rate trigger (K2)
 
@@ -253,7 +294,44 @@ and the spec agree. The preview and the committed
 template are regenerated in the same commit as the generator edits;
 check_template.py runs against the git HEAD baseline and must pass
 with the sanction entries and pass name, uuid, regex, and kv-surface
-checks for everything else.
+checks for everything else. docs/design.md described the committed
+template as "the v1 baseline until the phase 2 import", which this
+change makes false in the same commit that regenerates it; that
+sentence now states the regenerate-in-the-same-commit rule, and the
+"committed v1" wording in the generator and checker contracts becomes
+"committed baseline", which is what the mechanism has always meant.
+
+The stale-sanction guard is made durable in the same pass, from the
+adversarial review. check_uuids compared baseline objects against the
+generated set, so it could report a sanction as stale only while the
+sanctioned object was still in the baseline; the moment the committed
+template is regenerated after a removal (which this change is the
+first to do), those 15 entries would never be examined again and a
+later reintroduction would pass the gate in silence, contradicting the
+requirement's own "never silently outlive a reintroduction". A new
+check (d) intersects the sanction set with the identifiers the
+generator actually emits, independent of any baseline, and the
+stale-entry branch is removed from check_uuids so one owner reports
+it. Proven by mutation: sanctioning a trigger absent from the HEAD
+baseline (which only the new check can see) fails the gate.
+
+## 10. Reviewed and deliberately not changed
+
+The adversarial review proposed a sample-coverage guard on the two new
+min() triggers (`min(feeds_map_errors,13h)>0` and
+`min(pass_expired,15m)>0`), on the ground that min() evaluates over
+whatever values exist in the window, so a single positive sample fires
+while the item's history is shorter than the window. The mechanism is
+right and the worked example is not: Zabbix history lives in the
+server database, not on the host, so a host reboot leaves the window
+populated from before the outage. The exposure is the first window
+after an item is created, once, and it is shared verbatim by four
+pre-existing triggers built on the same idiom
+(feeds_config_approved_mismatch, feeds_rejected, feeds_failed). A
+count() guard on the two new triggers alone would break that idiom and
+introduce a sample-count constant that silently stops matching the
+window the moment an item's polling interval changes. Left as is; the
+idiom is a fleet-wide decision, not a per-trigger one.
 
 ## Verification (all local; deployment is the human follow-up)
 
@@ -267,4 +345,9 @@ checks for everything else.
 - gen-template.py then check_template.py green against the committed
   baseline; the trigger and item counts in the summary line change by
   exactly the designed amounts.
+- The tests that drive a wait loop through a faked clock budget their
+  sleeps: a loop that stops yielding has to fail with a named error,
+  because a hang inside next() burns the whole build timeout and
+  reports nothing, which is the gate behaviour this repo refuses
+  everywhere else.
 - openspec validate close-nodeguard-alerting-gaps --strict.

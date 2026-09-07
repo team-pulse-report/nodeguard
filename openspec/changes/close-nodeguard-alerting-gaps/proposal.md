@@ -59,7 +59,12 @@ review (K2) has no alarm on its sustained symptom.
   suricata_rules_mtime. Trigger dependencies (Zabbix name-referenced,
   rendered through the single render_trigger change point) make the
   nodata-based warnings depend on the frozen-kv HIGH trigger so a dead
-  telemetry chain pages once.
+  telemetry chain pages once; that HIGH gains a nodata half so it is
+  recalculated on a timer and can fire at all once values stop, the
+  stats-unreadable trigger is split so its value half is never
+  suppressed, and the responder heartbeat and not-consuming warnings
+  depend on the pre-existing unit-down trigger for the same page-once
+  reason.
 - zbx/dashboards.py points the alert-to-block graph at the new rate
   twins instead of the cumulative counters.
 - zbx/check_template.py's documented kv surface and
@@ -78,9 +83,14 @@ review (K2) has no alarm on its sustained symptom.
   units/suricata-update.service (ExecStartPost stamp),
   zbx/gen-template.py (item and trigger set, severities, dependencies),
   zbx/dashboards.py (graph datasets), zbx/removed-objects.txt (sanction
-  entries), zbx/check_template.py (kv surface),
-  zbx/sample-nodeguard.kv, zbx/preview-template-v2.json, and
-  templates/zabbix-nodeguard-template.json (regenerated).
+  entries), zbx/check_template.py (kv surface, plus a stale-sanction
+  guard judged against what the generator emits so it survives the
+  baseline being regenerated), zbx/sample-nodeguard.kv,
+  zbx/preview-template-v2.json,
+  templates/zabbix-nodeguard-template.json (regenerated), and
+  docs/design.md, whose statement that the committed template is the v1
+  baseline until the phase 2 import this change makes false in the same
+  commit.
 - Rollout (human follow-up, not gated by this change): deploy the
   changed binaries and unit to devops-hive-node-2 and node-3, run
   systemctl daemon-reload, restart nodeguard-responder, and import the

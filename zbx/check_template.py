@@ -9,7 +9,7 @@ Contract (nonzero exit on any failure):
     (--sample; zbx/sample-nodeguard.kv covers every documented key). The
     LLD extraction logic itself is re-run in Python and must find every
     per-feed key while excluding the _min aggregate.
-(b) Display names of items that existed in the committed v1 template are
+(b) Display names of items that exist in the committed baseline are
     byte-for-byte unchanged: dashboards address svggraph datasets by item
     NAME pattern, so a rename would silently empty every graph. LLD item
     prototype display names are covered too, scoped per discovery rule:
@@ -23,7 +23,11 @@ Contract (nonzero exit on any failure):
     file named by --baseline (for the gitless build container). A
     changed uuid means delete-and-recreate on import: itemid churn and
     irreversible history loss.
-(d) Every template item key is either the master item, an LLD artifact
+(d) No object sanctioned in zbx/removed-objects.txt is still emitted by
+    the generator. Checked against the generated template rather than
+    the baseline, so the guard survives the baseline being regenerated
+    after a removal and still catches a later reintroduction.
+(e) Every template item key is either the master item, an LLD artifact
     (discovery rule or prototype key), or maps onto the documented kv key
     list (a trailing .rate twin maps onto its source field).
 
@@ -84,10 +88,15 @@ DOCUMENTED_KV_FIELDS = {
     # units and timers
     "suricata", "responder", "xdp_unit", "maps_unit", "watchdog_timer",
     "sweep_timer",
-    # suricata and responder
+    # suricata and responder. resp_kv_ts is the responder's heartbeat
+    # source; the exporter derives resp_kv_age from it, so it is
+    # documented but deliberately untemplated (template keys have to be a
+    # subset of this surface, not equal to it).
     "kernel_drops", "suricata_alerts", "resp_alerts_seen",
     "resp_blocks_issued", "resp_dryrun_would_block", "resp_last_alert_ts",
-    "resp_last_action_ts",
+    "resp_last_action_ts", "resp_kv_ts", "resp_kv_age", "resp_lag_s",
+    # suricata ruleset freshness
+    "suricata_update_ts", "suricata_rules_mtime",
     # watchdog internals and anomaly detector
     "wd_canary_fail", "wd_lifeline_fail", "wd_toolfail", "wd_clean",
     "anomaly_count", "anomaly_shadow_count", "anomaly_last_ts",
@@ -96,8 +105,10 @@ DOCUMENTED_KV_FIELDS = {
     "feeds_journal_reset", "feeds_churn_held", "feeds_last_run_ts",
     "feeds_entries", "feeds_candidates", "feeds_rejected", "feeds_failed",
     "feeds_map_errors", "feeds_last_success_ts_min",
+    # geo. geo_ts is the success stamp geo_age is derived from, so it is
+    # documented and untemplated for the same reason as resp_kv_ts.
     "geo_summary", "geo_sources_hitting", "geo_located",
-    "geo_countries",
+    "geo_countries", "geo_ts", "geo_age",
     "top_blocked_1", "top_blocked_2", "top_blocked_3", "top_blocked_4", "top_blocked_5",
     "geo_country_1", "geo_country_2", "geo_country_3", "geo_country_4", "geo_country_5",
     "feeds_last_success_ts_spamhaus_drop_v4",
@@ -306,10 +317,24 @@ def check_names(c, exp, base, removed):
              "byte-for-byte")
 
 
+def present_identifiers(exp):
+    """The identifiers the generated template actually emits, keyed by
+    sanction kind and named exactly as removed-objects.txt names them."""
+    return {
+        "item": {i["key"] for i in walk_items(exp)},
+        "trigger": {t["name"] for t in walk_triggers(exp)},
+        "discovery_rule": {d["key"] for d in discovery_rules(exp)},
+        "item_prototype": {k for k, _ in
+                           proto_pairs(exp, "item_prototypes", "key")},
+        "trigger_prototype": {k for k, _ in
+                              proto_pairs(exp, "trigger_prototypes", "name")},
+    }
+
+
 def check_uuids(c, exp, base, removed):
     """(c) uuids of pre-existing objects unchanged vs the baseline;
-    sanctioned removals may be absent, but a sanctioned object still
-    present in v2 is stale-sanction drift and fails."""
+    sanctioned removals may be absent, but a sanctioned object the
+    generator still emits is stale-sanction drift and fails."""
     problems = []
 
     def cmp_map(label, base_pairs, new_pairs, sanctioned=frozenset()):
@@ -321,10 +346,6 @@ def check_uuids(c, exp, base, removed):
                     problems.append("%s %r missing from v2 (not "
                                     "sanctioned in removed-objects.txt)"
                                     % (label, key))
-            elif key in sanctioned:
-                problems.append("%s %r is sanctioned as removed but "
-                                "still present in v2 (stale entry in "
-                                "removed-objects.txt)" % (label, key))
             elif nuuid != buuid:
                 problems.append("%s %r uuid changed %s -> %s"
                                 % (label, key, buuid, nuuid))
@@ -361,8 +382,29 @@ def check_uuids(c, exp, base, removed):
         c.ok("every pre-existing object keeps its committed uuid")
 
 
+def check_sanctions(c, exp, removed):
+    """(d) no sanctioned object is still emitted by the generator.
+    Checked against the GENERATED template, never against the baseline:
+    a baseline-relative check can only see a stale sanction while the
+    sanctioned object is still in the baseline, so the moment the
+    committed template is regenerated after a removal the entry would go
+    unexamined forever and a later reintroduction would pass the gate in
+    silence."""
+    present = present_identifiers(exp)
+    stale = []
+    for kind in sorted(REMOVED_KINDS):
+        for ident in sorted(removed[kind] & present[kind]):
+            stale.append("%s %r" % (kind, ident))
+    if stale:
+        c.fail("stale-sanction",
+               "sanctioned as removed in removed-objects.txt but still "
+               "emitted by the generator: %s" % ", ".join(stale))
+    else:
+        c.ok("no sanctioned removal is still emitted by the generator")
+
+
 def check_keys(c, exp):
-    """(d) item keys are a subset of the documented kv surface."""
+    """(e) item keys are a subset of the documented kv surface."""
     bad = []
     for it in walk_items(exp):
         key = it["key"]
@@ -392,8 +434,9 @@ def check_keys(c, exp):
 
 def main():
     """Command-line entry point: load the generated template, baseline,
-    and sample, run all four checks (regex extraction, v1 names, uuid
-    carry-over, kv surface), and return nonzero if any check failed."""
+    and sample, run all five checks (regex extraction, v1 names, uuid
+    carry-over, sanction staleness, kv surface), and return nonzero if
+    any check failed."""
     ap = argparse.ArgumentParser(
         description="Assert the generated nodeguard template preserves "
                     "v1 names and uuids, extracts every field from a "
@@ -426,6 +469,7 @@ def main():
     check_regexes(c, exp, sample)
     check_names(c, exp, base, removed)
     check_uuids(c, exp, base, removed)
+    check_sanctions(c, exp, removed)
     check_keys(c, exp)
 
     if c.failures:

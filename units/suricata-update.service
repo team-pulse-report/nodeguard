@@ -7,14 +7,21 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/bin/suricata-update
 ExecStartPost=-/usr/bin/suricatasc -c ruleset-reload-nonblocking
+# Last-SUCCESSFUL-update stamp: no "-" prefix, so systemd runs it only
+# when ExecStart succeeded, which is what makes the exporter's staleness
+# math mean "the rules are old" rather than "the unit ran". It follows
+# the reload because a failure here must not suppress the reload, which
+# is the enforcement-relevant half; %% escapes the systemd specifier so
+# date sees a literal +%s. /var/lib survives reboot, as feeds.kv does.
+ExecStartPost=/bin/sh -c '/usr/bin/date +%%s > /var/lib/nodeguard/suricata-update.stamp'
 # NOTE: Type=oneshot defaults to an infinite start timeout, so a stalled
 # ruleset download would stop the daily timer firing rather than fail.
 TimeoutStartSec=30min
 # Hardening (evaluation finding S2). No bpf(2) here: this unit only
 # fetches rules and pokes the Suricata command socket, which is a socket
 # connect a read-only mount permits. /var/lib/nodeguard is writable for
-# the update stamp close-nodeguard-alerting-gaps adds, so that stamp
-# cannot fail on EROFS in either landing order.
+# the last-successful-update stamp above, which would otherwise fail on
+# EROFS.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

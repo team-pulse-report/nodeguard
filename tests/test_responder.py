@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 """Unit tests for bin/nodeguard-responder: the seven gates in their
-documented order, TTL escalation, the rate caps, and the journal's
-durability rules. Every event is driven through handle_event, so no
-daemon, no eve.json tail, and no subprocess is involved."""
+documented order, TTL escalation, the rate caps, the journal's
+durability rules, and the kv heartbeat and alert-lag telemetry that make
+a wedged responder visible. Every event is driven through handle_event,
+so no daemon, no eve.json tail, and no subprocess is involved."""
 
+import datetime
 import ipaddress
 import json
 import os
@@ -30,6 +32,10 @@ TTL_BASE = 3600
 TTL_MAX = 86400
 BOOT_ID = "00000000-0000-4000-8000-000000000001"
 OTHER_BOOT_ID = "00000000-0000-4000-8000-000000000002"
+# A whole-second processing moment for the lag arithmetic: a fractional
+# one makes the microsecond round trip through the ISO 8601 stamp land
+# either side of the integer boundary, which would flake.
+NOW = 1788645600.0
 
 
 def alert(**over):
@@ -503,6 +509,188 @@ class AllowCacheTest(ResponderFixture):
         self.assertTrue(cache.protected("198.51.100.9"))
         self.assertFalse(cache.protected(ATTACKER))
         self.assertEqual(len(fake.calls), 1)  # one dump per TTL window
+
+
+class SleepBudgetExceeded(AssertionError):
+    """A faked wait loop slept past its budget without yielding. An
+    AssertionError so unittest reports a failure: a wait loop that stops
+    yielding would otherwise spin inside next() and hang the whole run."""
+
+
+class FakeClock:
+    """Stand-in for the time module inside follow(): a sleep is recorded
+    rather than taken, so the wait branches run at test speed. The
+    recorded sleeps are budgeted, because a generator that sleeps without
+    yielding never returns to the test and a hang carries no diagnostic."""
+
+    MAX_SLEEPS = 8
+
+    def __init__(self):
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        """Record the requested sleep and return immediately, until the
+        budget is spent; past that the wait loop is not yielding and the
+        test has to fail rather than block."""
+        self.sleeps.append(seconds)
+        if len(self.sleeps) > self.MAX_SLEEPS:
+            raise SleepBudgetExceeded(
+                "the wait loop slept %d times without yielding"
+                % len(self.sleeps))
+
+    def time(self):
+        """Wall clock, unchanged; only sleeping is faked."""
+        return time.time()
+
+    def monotonic(self):
+        """Monotonic clock, unchanged; only sleeping is faked."""
+        return time.monotonic()
+
+
+class KvHeartbeatTest(ResponderFixture):
+    """Finding O1: a wedged responder served its last kv values forever.
+    The flush is still debounced, but a live event loop now rewrites the
+    file at least once per heartbeat interval and stamps every write."""
+
+    def kv_fields(self):
+        """The published kv file as {key: value}."""
+        with open(responder.RESP_KV) as f:
+            return dict(line.strip().split("=", 1) for line in f if line.strip())
+
+    def kv_inode(self):
+        """The published file's inode. Every flush publishes through a
+        fresh temp file and a rename, so a changed inode is proof the
+        file was rewritten and an unchanged one proof it was not."""
+        return os.stat(responder.RESP_KV).st_ino
+
+    def flushed_state(self):
+        """A state whose first flush has already published a kv file."""
+        st = self.state()
+        st.flush_sec()
+        return st
+
+    def age_flush(self, st, seconds):
+        """Backdate the last flush by seconds, standing in for the
+        passage of time without sleeping through it."""
+        st.sec_last_flush = time.time() - seconds
+
+    def test_every_flush_stamps_the_kv_timestamp(self):
+        st = self.flushed_state()
+        fields = self.kv_fields()
+        self.assertIn("ng.resp_kv_ts", fields)
+        self.assertLessEqual(abs(int(fields["ng.resp_kv_ts"]) - time.time()), 5)
+        self.assertIn("ng.resp_lag_s", fields)
+
+    def test_a_dirty_change_inside_the_debounce_is_not_written(self):
+        st = self.flushed_state()
+        inode = self.kv_inode()
+        st.sec["resp_alerts_seen"] = 7
+        st.sec_dirty = True
+
+        st.flush_sec()
+
+        self.assertEqual(self.kv_inode(), inode)
+        self.assertEqual(self.kv_fields()["ng.resp_alerts_seen"], "0")
+
+    def test_a_dirty_change_after_the_debounce_is_written(self):
+        st = self.flushed_state()
+        st.sec["resp_alerts_seen"] = 7
+        st.sec_dirty = True
+        self.age_flush(st, responder.KV_FLUSH_S)
+
+        st.flush_sec()
+
+        self.assertEqual(self.kv_fields()["ng.resp_alerts_seen"], "7")
+        self.assertFalse(st.sec_dirty)
+
+    def test_an_idle_responder_is_not_rewritten_before_the_heartbeat(self):
+        st = self.flushed_state()
+        inode = self.kv_inode()
+        self.age_flush(st, responder.KV_HEARTBEAT_S - 1)
+
+        st.flush_sec()
+
+        self.assertEqual(self.kv_inode(), inode)
+
+    def test_an_idle_responder_is_rewritten_at_the_heartbeat(self):
+        # Quiet and dead have to be distinguishable: with nothing dirty
+        # and no new alert, the file is still republished with a fresh
+        # stamp.
+        st = self.flushed_state()
+        inode = self.kv_inode()
+        stamped = int(self.kv_fields()["ng.resp_kv_ts"])
+        self.age_flush(st, responder.KV_HEARTBEAT_S)
+
+        st.flush_sec()
+
+        self.assertNotEqual(self.kv_inode(), inode)
+        self.assertGreaterEqual(int(self.kv_fields()["ng.resp_kv_ts"]),
+                                stamped)
+
+    def test_a_missing_eve_json_still_yields_the_idle_sentinel(self):
+        # The one live-loop state that used to sleep and continue without
+        # yielding: while eve.json is absent the responder is alive, so
+        # the heartbeat must keep advancing.
+        clock = FakeClock()
+        ngtest.patch_attrs(self, responder, time=clock)
+        stream = responder.follow(os.path.join(self.tmp, "absent.json"))
+        self.addCleanup(stream.close)
+
+        self.assertIsNone(next(stream))
+        self.assertIsNone(next(stream))
+
+        self.assertEqual(clock.sleeps[:2], [2, 2])
+
+
+class AlertLagTest(ResponderFixture):
+    """Finding O1: the alert-to-decision lag is measured against the EVE
+    record's own timestamp, and a hostile one never fabricates a value."""
+
+    def stamp(self, offset_s, now=NOW):
+        """An EVE timestamp offset_s seconds before now, in the ISO 8601
+        form with an offset that Suricata writes."""
+        moment = datetime.datetime.fromtimestamp(now - offset_s,
+                                                 datetime.timezone.utc)
+        return moment.isoformat()
+
+    def test_a_lag_is_measured_from_the_record_timestamp(self):
+        self.assertEqual(responder.eve_lag(self.stamp(12), NOW), 12)
+
+    def test_suricatas_compact_offset_form_parses(self):
+        # Suricata writes "+0000", not "+00:00"; a parser that rejected it
+        # would silently never update the lag.
+        self.assertEqual(
+            responder.eve_lag("2026-09-06T12:00:00.000000+0000",
+                              datetime.datetime(
+                                  2026, 9, 6, 12, 0, 30,
+                                  tzinfo=datetime.timezone.utc).timestamp()),
+            30)
+
+    def test_a_future_dated_record_clamps_to_zero(self):
+        self.assertEqual(responder.eve_lag(self.stamp(-3600), NOW), 0)
+
+    def test_hostile_timestamps_are_unusable_rather_than_wrong(self):
+        for stamp in (None, int(NOW), "", "not-a-timestamp",
+                      "2026-09-06T12:00:00.000000"):
+            with self.subTest(stamp=stamp):
+                self.assertIsNone(responder.eve_lag(stamp, NOW))
+
+    def test_a_consumed_alert_exports_its_lag(self):
+        st = self.state()
+
+        self.feed(st, alert(timestamp=self.stamp(9)), now=NOW)
+
+        self.assertEqual(st.sec["resp_lag_s"], 9)
+
+    def test_an_unusable_timestamp_leaves_the_previous_lag_in_place(self):
+        st = self.state()
+        st.sec["resp_lag_s"] = 7
+
+        for line in (alert(timestamp="not-a-timestamp"), alert()):
+            self.feed(st, line)
+
+        self.assertEqual(st.sec["resp_lag_s"], 7)
+        self.assertEqual(st.malformed, 0)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ empty/unknown result and nothing else in the system notices. Run from a
 timer, never in the datapath.
 
 Outputs (atomic tmp+rename):
-- /run/nodeguard/geo.kv: ng.geo_* fields (top attacker countries, totals)
+- /run/nodeguard/geo.kv: ng.geo_* fields (top attacker countries, totals,
+  and the ng.geo_ts success stamp the exporter derives an age from)
   cat'd into the monitoring snapshot by nodeguard-status.
 - /var/lib/nodeguard/attack-map.svg: a self-contained world map with the
   top blocked sources plotted, sized by hit volume; served to the
@@ -30,6 +31,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 
 PIN = "/sys/fs/bpf/nodeguard"
 DBIP_STARTS = "/usr/local/share/nodeguard/dbip.starts"
@@ -218,9 +220,21 @@ def main():
     # a compact one-line summary for a text tile
     summary = " ".join(f"{cc}:{n}" for cc, n in ranked[:6]) or "none"
     lines.append(f"ng.geo_summary={summary}")
+    # ORDER: the map is rendered and published BEFORE the stamped kv, so
+    # the stamp is the last artifact of the run and a render or write
+    # failure in the map half ages the whole run out instead of leaving a
+    # green freshness signal over a frozen map.
+    write_atomic(MAP_SVG, render_svg(points))
+
+    # SAFETY: the stamp rides the same write as the data it dates, and
+    # every failure path returns before this write, so it advances on a
+    # successful run only. The top-level handler exits 0 on any error by
+    # design, so this timestamp (and the age the exporter derives from
+    # it) is the ONLY signal that a persistently failing geo run is
+    # serving an ever-older picture.
+    lines.append(f"ng.geo_ts={int(time.time())}")
     write_atomic(GEO_KV, "\n".join(lines) + "\n")
 
-    write_atomic(MAP_SVG, render_svg(points))
     log(f"geo: {len(hits)} hitting sources, {located} located, "
         f"{len(countries)} countries, {len(points)} plotted")
 

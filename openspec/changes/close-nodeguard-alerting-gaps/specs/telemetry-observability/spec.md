@@ -46,6 +46,13 @@ generator and the committed artifact cannot diverge.
 - THEN the checker fails the build, so a sanction can never land ahead
   of its removal or silently outlive a reintroduction
 
+#### Scenario: the sanction guard survives regeneration
+- WHEN the committed template has been regenerated after a removal, so
+  a sanctioned object is in neither the baseline nor the generated
+  template, and a later edit reintroduces it
+- THEN the checker still fails, because staleness is judged against
+  what the generator emits rather than against the baseline
+
 ## ADDED Requirements
 
 ### Requirement: Responder liveness SHALL be a first-class heartbeat
@@ -104,6 +111,12 @@ either producer stops succeeding.
   stamp is written only on a successful update and its age now exceeds
   two cycles plus the timer's randomized-delay margin
 
+#### Scenario: the freshness stamp is the last artifact of the run
+- WHEN a geo run computes its country statistics and then fails while
+  rendering or publishing the attack map
+- THEN no timestamp is written, so the derived age keeps growing
+  instead of reporting a fresh run over a frozen map
+
 #### Scenario: never-ran states stay visibly unknown
 - WHEN the geo run has never completed or no update success stamp
   exists
@@ -154,7 +167,14 @@ The no-data-based warnings for a dead kv export chain SHALL declare a
 template trigger dependency on the frozen-kv High trigger, referenced
 by its stable trigger name so the dependency survives regeneration and
 import, while value-based warnings that represent independent failures
-SHALL carry no such dependency.
+SHALL carry no such dependency. A depended-on trigger SHALL be
+recalculated on a timer and not only when values arrive, so that it can
+enter Problem, and therefore suppress its dependents, in the very state
+where the export has stopped. A trigger that mixes a value clause with
+a no-data clause SHALL be split before the dependency is attached, so
+no dependency can suppress a value-based fault. Warnings that restate a
+fault a more specific trigger already names SHALL depend on that
+trigger.
 
 #### Scenario: a dead export chain pages one High
 - WHEN the watchdog timer dies or the kv runtime directory is wiped
@@ -167,6 +187,22 @@ SHALL carry no such dependency.
   fresh, such as a stats read failure with an advancing kv timestamp
 - THEN that trigger fires normally, because only the no-data-based
   warnings depend on the frozen-kv trigger
+
+#### Scenario: a value clause is never suppressed by a no-data clause
+- WHEN a stats read failure is reported while the frozen-kv High
+  trigger is itself in Problem, for example on a host whose clock has
+  skewed past the fuzzytime window
+- THEN the value-based stats-unreadable warning still fires, because
+  the no-data half was split into its own trigger and only that half
+  carries the dependency
+
+#### Scenario: a stopped responder pages once
+- WHEN the responder unit is stopped while its kv file survives on
+  tmpfs and Suricata keeps alerting
+- THEN the unit-down Warning fires and the heartbeat-age and
+  not-consuming Warnings are suppressed as dependents, so the operator
+  gets the fault once and those two keep their meaning for a unit that
+  is active but wedged
 
 #### Scenario: regeneration preserves the dependency wiring
 - WHEN the template is regenerated

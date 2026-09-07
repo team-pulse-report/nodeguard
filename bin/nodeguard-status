@@ -20,6 +20,11 @@ RESP_KV=/run/nodeguard/responder.kv
 FEEDS_KV=/var/lib/nodeguard/feeds/feeds.kv
 ALLOW_KV=/run/nodeguard/allow.kv
 GEO_KV=/run/nodeguard/geo.kv
+# Written by suricata-update.service's success-gated ExecStartPost, in
+# /var/lib so the staleness math survives a reboot; the rules file is
+# what suricata actually loads.
+SURICATA_STAMP=/var/lib/nodeguard/suricata-update.stamp
+SURICATA_RULES=/var/lib/suricata/rules/suricata.rules
 
 kv=0
 [ "${1:-}" = "--kv" ] && kv=1
@@ -182,8 +187,14 @@ for k, v in d.items():
         sweep_ts=$(awk -F= '$1 == "ng.sweep_ts" { print $2 }' "$MAPSTAT")
         [ -n "$sweep_ts" ] && echo "ng.sweep_age=$(( $(date +%s) - sweep_ts ))"
     fi
+    # The responder's heartbeat: resp_kv_ts is rewritten at least once a
+    # minute while its event loop is alive, so the derived age is what
+    # separates a quiet responder from a wedged one still serving its
+    # last values. Absent stamp, absent age (an older responder build).
     if [ -f "$RESP_KV" ]; then
         cat "$RESP_KV"
+        resp_kv_ts=$(awk -F= '$1 == "ng.resp_kv_ts" { print $2 }' "$RESP_KV")
+        [ -n "$resp_kv_ts" ] && echo "ng.resp_kv_age=$(( $(date +%s) - resp_kv_ts ))"
     fi
     # Allow-generation state (written by nodeguard-maps after reconcile).
     # Absent before the first generation of this boot: keys omitted, which
@@ -192,10 +203,26 @@ for k, v in d.items():
         cat "$ALLOW_KV"
     fi
     # Attack-origin geoip enrichment (nodeguard-geo; fail-open, absent
-    # until the first geo run and only if the DB is installed).
+    # until the first geo run and only if the DB is installed). geo_ts is
+    # stamped on a successful run only, so the derived age is the only
+    # signal that a run which swallowed its failure and exited 0 has been
+    # serving the same picture for days.
     if [ -f "$GEO_KV" ]; then
         cat "$GEO_KV"
+        geo_ts=$(awk -F= '$1 == "ng.geo_ts" { print $2 }' "$GEO_KV")
+        [ -n "$geo_ts" ] && echo "ng.geo_age=$(( $(date +%s) - geo_ts ))"
     fi
+    # Suricata ruleset freshness. Every automated block is driven by the
+    # et/open rules, so a chronically failing update is an enforcement
+    # outage that nothing else reports. A missing stamp is the
+    # never-succeeded state and stays omitted; a corrupt one is omitted
+    # rather than published as a number that is not an epoch.
+    if [ -s "$SURICATA_STAMP" ]; then
+        sur_update_ts=$(awk 'NR == 1 && /^[0-9]+$/ { print }' "$SURICATA_STAMP")
+        [ -n "$sur_update_ts" ] && echo "ng.suricata_update_ts=$sur_update_ts"
+    fi
+    sur_rules_mtime=$(stat -c %Y "$SURICATA_RULES" 2>/dev/null || true)
+    [ -n "$sur_rules_mtime" ] && echo "ng.suricata_rules_mtime=$sur_rules_mtime"
     # Feed loader state, persisted across reboot so staleness triggers
     # stay honest (a tmpfs fragment would false-alarm on every boot).
     if [ -f "$FEEDS_KV" ]; then
