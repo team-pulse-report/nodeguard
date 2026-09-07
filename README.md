@@ -3,9 +3,9 @@
 ![nodeguard: XDP/eBPF firewall with Suricata IPS wiring](docs/media/nodeguard-hero.png)
 
 An eBPF/XDP firewall with Suricata IPS wiring for small Linux gateways
-(Fedora 44, stock packages only). Suricata detects passively; a ~200-line
-custom XDP program blocks confirmed attackers at the driver, with in-kernel
-TTL expiry and fail-open behaviour everywhere:
+(Fedora 44, stock packages only). Suricata detects passively; a roughly
+400-line custom XDP program blocks confirmed attackers at the driver, with
+in-kernel TTL expiry and fail-open behaviour everywhere:
 
 - No program attached, empty maps, dead responder, dead Suricata: traffic
   flows. The only drop is an unexpired blocklist hit.
@@ -105,11 +105,11 @@ and triggers, and three dashboards sit on top: Overview (attached,
 enforcing, healthy right now), Security (scan and attack pressure, and
 whether the pipeline is or would be responding), and Capacity and
 Pipeline (what fills up or goes stale before morning). The dashboards and
-template are generated from `zbx/` (proposed in OpenSpec change
-`add-nodeguard-telemetry`) and address hosts through a Zabbix host group,
-so adding a gateway is: install nodeguard, link the template, add the
-host to the group; no widget rework. `docs/legend.html` explains every
-panel.
+template are generated from `zbx/` (OpenSpec change
+`add-nodeguard-telemetry`, shipped and archived 2026-09-06) and address
+hosts through a Zabbix host group, so adding a gateway is: install
+nodeguard, link the template, add the host to the group; no widget rework.
+`docs/legend.html` explains every panel.
 
 ## The 2am commands
 

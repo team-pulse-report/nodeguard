@@ -23,7 +23,7 @@ contract (ADR 0003).
 ## The datapath (kernel)
 
 ### src/nodeguard_kern.c
-The whole firewall decision, ~330 lines of eBPF C, GPL-2.0 (kernel
+The whole firewall decision, roughly 400 lines of eBPF C, GPL-2.0 (kernel
 requirement). Attached to one NIC via the libxdp dispatcher.
 
 - The `.maps` declarations: `allow4/allow6` (never-block LPM tries),

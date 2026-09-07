@@ -14,6 +14,13 @@ main branch.
 ### Fixed
 
 - 28 findings from a 36-agent adversarial review (1 blocker, 9 major, 18 minor), including: kill switch writes now verified by read-back with escalation to detach on failure; the sweep re-checks entries under an inter-process lock so a fresh re-block cannot be deleted; attach state is three-valued (attached, detached, unknown) end to end so a broken xdp-loader is never read as a pristine datapath; pre-existing dispatcher members are identity-checked, never blessed; the responder follows eve.json across logrotate without dropping alerts, counts offenses (block windows) rather than alert lines for TTL escalation, and accounts rate caps on attempts identically in dry-run and enforce modes; the IPv4 WireGuard-port pass ignores non-first fragments instead of misreading payload; the deploy owns /etc/logrotate.d/suricata, gates on systemd-analyze verify, and requires the suricata RPM up front; allowlist reconciliation gained a non-propagating systemctl reload verb so it never blips the WAN link.
+- The 2026-09-06 adversarial evaluation, in four changes: OpenSpec change
+  `fix-nodeguard-state-lifecycle` ("Fix state lifecycle across reboot,
+  reload, and re-block paths"), `harden-nodeguard-control-plane` ("Harden
+  control plane units, kv writes, transport, journal"),
+  `fix-nodeguard-deploy-reliability` ("Verify deploys, time-bound oneshots,
+  record build provenance"), and `close-nodeguard-alerting-gaps` ("Close
+  alerting gaps with heartbeats, freshness stamps, triggers").
 
 
 ### Added
@@ -70,7 +77,7 @@ main branch.
   enables and starts nothing (bring-up is phased and manual).
 - arc42 design document (`docs/design.md`): architecture, failure-mode
   table, phased install plan, and rollback.
-- Five ADRs (`docs/adr/`) recording the load-bearing decisions and their
+- Seven ADRs (`docs/adr/`) recording the load-bearing decisions and their
   rejected alternatives.
 - OpenSpec change `add-nodeguard-firewall` (`openspec/`) specifying the XDP
   enforcement, Suricata detection, and alert-to-block response capabilities.
@@ -89,10 +96,11 @@ main branch.
   coverage, churn brake, staleness), `ng.feeds_*` kv fields persisted across
   reboot, and Zabbix items and triggers including per-feed staleness and the
   config/approval-drift tripwire.
-- OpenSpec change `add-nodeguard-telemetry` (proposed): a count-only
-  `stats2` per-CPU map for protocol-sanity counters (TCP flag combinations,
-  low TTL, fragments; every new branch still resolves to `XDP_PASS`), a
-  uniform fail-to-unsupported kv discipline (a value that cannot be read is
+- OpenSpec change `add-nodeguard-telemetry` (shipped on both hosts and
+  archived 2026-09-06): a count-only `stats2` per-CPU map for
+  protocol-sanity counters (TCP flag combinations, low TTL, fragments; every
+  new branch still resolves to `XDP_PASS`), a uniform
+  fail-to-unsupported kv discipline (a value that cannot be read is
   omitted plus an explicit fail flag, never a silent zero), map-population
   stats cached from the existing 10-minute sweep so the 1-minute path stays
   O(1) in blocklist size, two redundant anomaly layers (gateway-local EWMA
@@ -100,3 +108,24 @@ main branch.
   generated master/dependent template v2, three fleet-scaling dashboards
   (Overview, Security, Capacity and Pipeline), and the `zbx/` generator
   suite that builds the template and dashboards.
+- OpenSpec change `add-nodeguard-test-suite` ("Add stdlib test suite and
+  contain parser crash paths"): a hermetic stdlib `unittest` suite over the
+  userspace control plane (no root, no network, no bpftool, no write outside
+  a temporary directory), run as `build/build.sh`'s first gate so a broken
+  control plane never spends compile or rehearsal time, plus the parser
+  crash paths it caught.
+
+### Changed
+
+- Telemetry shipped and archived (2026-09-06): the `stats2` object is
+  deployed on both hosts, the three enhanced dashboards replaced the legacy
+  Nodeguard board, `WD_ANOM_MODE=on` is live fleet-wide (alerting only; the
+  detector never touches enforcement), and the remaining anomaly-detector
+  maturation is carried as operational follow-up rather than a spec change.
+  ADR 0007 moved from proposed to accepted with it.
+- Responder enforcement enabled on the internet gateway, node-2
+  (2026-09-06), after a 44 hour dry-run in which the anti-spoofing gate
+  rejected all 362 single-packet reputation alerts and blocked nothing. The
+  remote node (node-3) stays in dry-run until a clean week on node-2.
+  Suricata's memory caps were finalized from the same production data
+  (MemoryHigh 1.5 GiB, MemoryMax 3 GiB, against an observed 872 MB peak).

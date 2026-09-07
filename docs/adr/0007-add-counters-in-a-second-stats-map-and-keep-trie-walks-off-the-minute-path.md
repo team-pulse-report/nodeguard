@@ -2,7 +2,12 @@
 
 ## Status
 
-proposed (OpenSpec change add-nodeguard-telemetry), 2026-09-05
+accepted, 2026-09-06
+
+Amendment, 2026-09-06 (status correction only; the decision below is
+unchanged): recorded as `proposed (OpenSpec change add-nodeguard-telemetry)`
+on 2026-09-05, and left at `proposed` after that change shipped to both
+hosts and was archived on 2026-09-06.
 
 ## Context
 
