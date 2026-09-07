@@ -14,6 +14,14 @@ be read as a bit-reproducibility guarantee.
   package NVRs, base image, or git commit differed, so "did the source
   change or just the compiler" is decidable from build/out alone
 
+#### Scenario: the commit field carries a commit rather than a permanent unknown
+- WHEN the build runs the documented container invocation against the
+  repository bind mount
+- THEN the build environment provides git and treats the mounted
+  checkout as a trusted one, so git_commit records the commit instead
+  of degrading to unknown on every build and leaving the field
+  worthless to the incident it exists for
+
 #### Scenario: missing provenance is visible, not silent
 - WHEN the container cannot determine the base image digest or the repo
   mount has no git metadata

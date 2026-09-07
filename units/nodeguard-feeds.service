@@ -6,6 +6,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/nodeguard-feeds run
+# NOTE: Type=oneshot defaults to an infinite start timeout, so a feed
+# fetch that never returns would stop the timer firing rather than fail.
+# Generous against the 6-hour timer period: a full load is minutes.
+TimeoutStartSec=30min
 # Hardening (evaluation finding S2). This unit parses bodies downloaded
 # from the internet. ProtectSystem=strict leaves /dev, /proc, and /sys
 # writable, so the bpffs pin directory keeps working; it is listed

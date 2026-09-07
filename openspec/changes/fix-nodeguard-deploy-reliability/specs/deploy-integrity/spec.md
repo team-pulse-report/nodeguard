@@ -45,12 +45,14 @@ the object.
 
 ### Requirement: Deploy verification SHALL run before installation and rollback state SHALL cover the object-spec pair
 The deploy verification block SHALL run against staged copies before
-the first install command (syntax checks, unit verification, content
-checks, hash comparison, and suricata -T against the staged
-suricata.yaml), so a verification failure leaves the host unchanged;
+the first install command (syntax checks, unit verification including
+the per-host drop-in, content checks, hash comparison, and suricata -T
+against the staged suricata.yaml on any host carrying a ruleset for it
+to load), so a verification failure leaves the host unchanged; a check
+that cannot run SHALL be reported as unvalidated rather than passed;
 and nodeguard-maps.spec SHALL rotate to .prev together with the kernel
-object under the same only-when-different guard, so rollback restores a
-consistent object-spec pair.
+object under a single only-when-different decision taken over the pair,
+so rollback restores a consistent object-spec pair.
 
 #### Scenario: verification failure leaves the host untouched
 - WHEN any verification step fails (a unit fails systemd-analyze
@@ -69,14 +71,30 @@ consistent object-spec pair.
   verification while a reference to a path this run does not ship
   still fails it
 
+#### Scenario: the per-host drop-in is verified with the unit it modifies
+- WHEN deploy.sh verifies the staged nodeguard-xdp.service
+- THEN the per-host drop-in is staged in the <unit>.d directory beside
+  it so systemd merges the two, and a malformed drop-in fails the
+  deploy instead of installing silently and failing at boot
+
 #### Scenario: suricata configuration is validated before it can go live
 - WHEN a generated suricata.yaml that suricata would refuse is staged
+  on a host whose ruleset is installed
 - THEN suricata -T fails the verification block and the broken
   configuration is never installed over the working one
 
+#### Scenario: a host with no ruleset yet reports unvalidated, not failed
+- WHEN deploy.sh runs at phase 0, before suricata-update has ever
+  written the ruleset the staged configuration names, so suricata -T
+  would fail on the missing rule file rather than on the configuration
+- THEN the deploy reports the staged suricata.yaml as unvalidated and
+  names the reason, and the bootstrap deploy proceeds rather than
+  aborting with nothing installed
+
 #### Scenario: rollback restores object and spec together
 - WHEN a --with-kernel deploy replaces a differing object and spec and
-  the operator later rolls back
+  the operator later rolls back, including after a sequence of deploys
+  in which one changed only the object and a later one only the spec
 - THEN both nodeguard_kern.o.prev and nodeguard-maps.spec.prev exist
   from the same pre-deploy state, so the restored pair passes the
   spec-object pairing check

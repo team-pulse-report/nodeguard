@@ -7,6 +7,9 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/bin/suricata-update
 ExecStartPost=-/usr/bin/suricatasc -c ruleset-reload-nonblocking
+# NOTE: Type=oneshot defaults to an infinite start timeout, so a stalled
+# ruleset download would stop the daily timer firing rather than fail.
+TimeoutStartSec=30min
 # Hardening (evaluation finding S2). No bpf(2) here: this unit only
 # fetches rules and pokes the Suricata command socket, which is a socket
 # connect a read-only mount permits. /var/lib/nodeguard is writable for

@@ -4,6 +4,10 @@ Description=nodeguard expired-block garbage collection
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 /usr/local/lib/nodeguard/ngmap.py sweep
+# NOTE: Type=oneshot defaults to an infinite start timeout, so a hung
+# sweep would stop the timer firing rather than fail. Sized inside the
+# 10-minute timer period.
+TimeoutStartSec=8min
 # Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
 # /proc, and /sys writable, so the bpffs pin directory keeps working; it
 # is listed anyway as documentation and against a semantics change.

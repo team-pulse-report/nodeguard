@@ -21,6 +21,7 @@ import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN_DIR = os.path.join(REPO_ROOT, "bin")
+BUILD_DIR = os.path.join(REPO_ROOT, "build")
 WATCHDOG = os.path.join(BIN_DIR, "nodeguard-watchdog")
 
 # Heredoc delimiter of the watchdog's embedded anomaly detector. The other
@@ -54,6 +55,22 @@ def load_bin(module_name, filename):
     sys.modules[module_name] = module
     loader.exec_module(module)
     _MODULE_CACHE[module_name] = module
+    return module
+
+
+def load_build(module_name, filename):
+    """Load one build/ script as a module and return it.
+
+    Kept separate from load_bin: the build helpers are not on the
+    installed library path, and nothing here should drag bin/ngmap.py in
+    behind them. They are also not registered in sys.modules, because
+    only the caller imports them.
+    """
+    path = os.path.join(BUILD_DIR, filename)
+    loader = importlib.machinery.SourceFileLoader(module_name, path)
+    spec = importlib.util.spec_from_loader(module_name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
     return module
 
 

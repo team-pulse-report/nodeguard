@@ -13,8 +13,17 @@ REPO=/work
 OUT="$REPO/build/out"
 mkdir -p "$OUT"
 
-dnf -q install -y clang llvm libbpf-devel libxdp-devel xdp-tools bpftool \
-    kernel-headers python3-pyyaml iproute >/dev/null
+# The packages that decide what the object compiles to; recorded in the
+# buildinfo from this one list, so the provenance file cannot name a
+# different toolchain from the one the build installed.
+TOOLCHAIN_PKGS=(clang llvm libbpf-devel libxdp-devel xdp-tools bpftool
+                kernel-headers)
+# git is not part of the toolchain and never reaches the object, so it
+# stays out of TOOLCHAIN_PKGS; it is installed because the base image
+# ships no git and the buildinfo's git_commit would otherwise degrade to
+# unknown on every single build, which is the one field an incident uses
+# to separate a source change from a toolchain change.
+dnf -q install -y "${TOOLCHAIN_PKGS[@]}" python3-pyyaml iproute git >/dev/null
 
 echo "== unit tests =="
 # The cheapest gate in this file, and it needs nothing the container
@@ -277,6 +286,12 @@ nsenter --net=/run/netns/ngtest xdp-loader unload lo -i "$prog_id"
 echo "== rehearsal PASSED =="
 
 echo "== per-host suricata.yaml =="
+# The generated header names the RPM the stock yaml was captured from, and
+# mkyaml.py reads it from this sidecar rather than a literal, so a stock
+# refresh that forgets the sidecar fails here instead of shipping a header
+# that lies about its source.
+STOCK_VERSION="$REPO/build/suricata-stock.version"
+[ -f "$STOCK_VERSION" ] || { echo "missing $STOCK_VERSION (the stock suricata NVR the generated header is rendered from)"; exit 1; }
 # HOSTS_DIR may point at a private overlay of host config dirs; real
 # deployments keep their host dirs outside this public repo.
 HOSTS_DIR="${HOSTS_DIR:-$REPO/hosts}"
@@ -293,6 +308,36 @@ python3 /work/zbx/check_template.py --sample /work/zbx/sample-nodeguard.kv \
     --template /tmp/template-check.json \
     --baseline /work/templates/zabbix-nodeguard-template.json
 echo "template drift gate passed"
+
+# Record what produced the object beside the object. This is PROVENANCE,
+# not a bit-reproducibility claim: two builds of the same commit may
+# differ, and this file is what makes the difference explainable during an
+# incident ("did the source change or just the compiler"). A value that
+# cannot be determined is written as unknown, never omitted.
+write_buildinfo() {
+    local info="$OUT/nodeguard_kern.o.buildinfo" pkg
+    # /work is a bind mount owned by the host uid while this container
+    # runs as root, so git rejects the checkout as dubious ownership
+    # (exit 128) and the commit would silently read unknown. Registering
+    # the path costs nothing: the container is thrown away after the run.
+    git config --global --add safe.directory "$REPO" >/dev/null 2>&1 || true
+    {
+        printf 'build_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'git_commit=%s\n' \
+            "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+        # The digest is not discoverable from inside a plain docker run,
+        # so the host resolves it and passes it in (see README).
+        printf 'image_digest=%s\n' "${IMAGE_DIGEST:-unknown}"
+        printf 'clang=%s\n' "$(clang --version | head -1)"
+        for pkg in "${TOOLCHAIN_PKGS[@]}"; do
+            printf 'rpm_%s=%s\n' "$pkg" \
+                "$(rpm -q "$pkg" 2>/dev/null || echo unknown)"
+        done
+    } > "$info"
+    cat "$info"
+}
+echo "== build provenance =="
+write_buildinfo
 
 sha256sum "$OUT/nodeguard_kern.o" | tee "$OUT/nodeguard_kern.o.sha256"
 echo "== build complete =="

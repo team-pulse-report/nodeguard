@@ -355,5 +355,30 @@ class IntegerRangeTest(unittest.TestCase):
         self.assertEqual(struct.unpack("<Q", value)[0], top)
 
 
+class BpftoolTimeoutTest(unittest.TestCase):
+    """The per-call bpftool bound is overridable, because one value cannot
+    serve both the whole-map dumps of the sweep (8min budget) and the
+    watchdog cycle (55s budget) that makes many calls in a row."""
+
+    def test_valid_override_is_honoured(self):
+        ngtest.patch_env(self, **{ngmap.BPFTOOL_TIMEOUT_ENV: "10"})
+        self.assertEqual(ngmap.bpftool_timeout_s(), 10)
+
+    def test_unusable_override_falls_back_to_the_default(self):
+        for raw in ("", "0", "-5", "10s", "abc"):
+            with self.subTest(raw=raw):
+                ngtest.patch_env(self, **{ngmap.BPFTOOL_TIMEOUT_ENV: raw})
+                self.assertEqual(ngmap.bpftool_timeout_s(),
+                                 ngmap.BPFTOOL_TIMEOUT_DEFAULT_S)
+
+    def test_the_watchdog_exports_the_override(self):
+        # The override only bounds the tight path if the tight path sets
+        # it; dropping the export would silently restore the loose default
+        # inside the 55s cycle.
+        with open(ngtest.WATCHDOG) as f:
+            source = f.read()
+        self.assertIn(f"export {ngmap.BPFTOOL_TIMEOUT_ENV}=", source)
+
+
 if __name__ == "__main__":
     unittest.main()

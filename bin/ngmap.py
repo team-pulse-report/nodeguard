@@ -27,6 +27,34 @@ import time
 
 PIN = "/sys/fs/bpf/nodeguard"
 BPFTOOL = "/usr/sbin/bpftool"
+# Bound on one bpftool call. The sweep, the watchdog cycle, and the feed
+# loader all shell out through here from Type=oneshot units, so a wedged
+# tool has to fail its own call rather than ride the unit's start timeout.
+# The default matches the bound bin/nodeguard-geo already uses for its map
+# dump, because the loosest consumers (sweep 8min, geo 4min) dump whole
+# maps and a tighter default would fail a slow-but-working dump. Callers
+# on a tight budget lower it through the environment instead: the watchdog
+# exports this variable, set from the shell-side NG_TOOL_TIMEOUT, for its
+# 55s cycle, and the export reaches every ngmap child it spawns directly
+# or through nodeguard-status.
+BPFTOOL_TIMEOUT_ENV = "NG_BPFTOOL_TIMEOUT"
+BPFTOOL_TIMEOUT_DEFAULT_S = 30
+
+
+def bpftool_timeout_s():
+    """Seconds to allow one bpftool call.
+
+    A non-numeric or zero override is ignored rather than raising: this
+    runs at import, and a typo in a unit's environment must not take every
+    map operation on the host down with it.
+    """
+    raw = os.environ.get(BPFTOOL_TIMEOUT_ENV, "")
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return BPFTOOL_TIMEOUT_DEFAULT_S
+
+
+BPFTOOL_TIMEOUT_S = bpftool_timeout_s()
 
 # INVARIANT: the widths of the packed map encodings above ("<I" keys,
 # "<Q" values). Every operator-supplied integer is range-checked against
@@ -68,13 +96,26 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+class BpftoolTimeout(RuntimeError):
+    """A bpftool call that never returned.
+
+    INVARIANT: distinct from the nonzero-exit RuntimeError so lookup_value
+    cannot absorb a wedged tool as an absent key; every other caller
+    already propagates it. Dependents: lookup_value.
+    """
+
+
 def bpftool(*args, parse_json=False):
     """Run the bpftool binary and return its output; the one place this file shells out to the kernel's BPF map tooling."""
     cmd = [BPFTOOL] + (["-j"] if parse_json else []) + list(args)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=BPFTOOL_TIMEOUT_S)
     except OSError as e:
         raise RuntimeError(f"cannot execute {BPFTOOL}: {e}") from e
+    except subprocess.TimeoutExpired as e:
+        raise BpftoolTimeout(
+            f"{' '.join(cmd)}: no answer in {BPFTOOL_TIMEOUT_S}s") from e
     if r.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd)}: {r.stderr.strip()}")
     return json.loads(r.stdout) if parse_json else r.stdout
@@ -127,6 +168,11 @@ def lookup_value(path, key):
     try:
         e = bpftool("map", "lookup", "pinned", path, "key",
                     *bytes_to_args(key), parse_json=True)
+    except BpftoolTimeout:
+        # SAFETY: a tool that never answered says nothing about the key;
+        # reporting it as absent here would turn a wedged bpftool into a
+        # silent "not blocked".
+        raise
     except RuntimeError as e:
         # A lookup MISS returns nonzero; bpftool's message for it varies
         # by version ("Not found", or empty stderr, rc 254). When the map

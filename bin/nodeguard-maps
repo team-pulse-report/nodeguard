@@ -103,7 +103,10 @@ PYEOF
             derpjson="$NG_RUN/derp-map.json"
             : > "$FRESH"
             rc=1
-            if tailscale debug derp-map > "$derpjson" 2>/dev/null; then
+            # Bounded: this runs under the hourly allow-refresh timer, and
+            # a wedged tailscaled must fail the DERP fold (which keeps the
+            # cached entries) rather than hang the unit.
+            if timeout "$NG_TOOL_TIMEOUT" tailscale debug derp-map > "$derpjson" 2>/dev/null; then
                 python3 - "$derpjson" > "$FRESH" <<'PYEOF'
 import json, sys
 with open(sys.argv[1]) as f:

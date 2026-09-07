@@ -4,6 +4,13 @@ Description=nodeguard watchdog cycle (lifelines, canary, port refresh)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/nodeguard-watchdog
+# NOTE: systemd's DefaultTimeoutStartSec does not apply to Type=oneshot;
+# without this the start timeout is infinity, and a cycle blocked on a
+# wedged tool leaves the unit activating forever, which stops the timer
+# firing at all: no canary, no lifeline soft-off, no port refresh, no kv
+# export, and no failed state for the unit alarms to see. Sized inside
+# the 1-minute timer period so a killed cycle is retried on the next fire.
+TimeoutStartSec=55s
 # Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
 # /proc, and /sys writable, so the bpffs pin directory keeps working; it
 # is listed anyway as documentation and against a semantics change.

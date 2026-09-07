@@ -9,7 +9,16 @@ mkdir -p "$NG_RUN"
 
 # SAFETY: every pre-existing member must pass the map-identity check; a
 # member enforcing orphaned maps is unloaded, never blessed.
-existing=$(ng_prog_ids) || existing=""
+existing=$(ng_prog_ids)
+probe_rc=$?
+# SAFETY: absorbing the failure here would scan an empty member list and
+# then load a SECOND nodeguard program beside one that may already be
+# attached; an unreadable dispatcher fails the attach instead, and the
+# host runs open and says so.
+if [ "$probe_rc" -ne 0 ]; then
+    ng_log "attach refused: attach state UNKNOWN (xdp-loader status failed); host runs OPEN" crit
+    exit 1
+fi
 verified=""
 for id in $existing; do
     if ng_verify_map_identity "$id"; then

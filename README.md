@@ -36,8 +36,9 @@ etc/                        shared config (protected.conf, sids.conf)
 hosts/example-gateway/      template per-host config (documentation IPs)
 tests/                      stdlib unit suite (no root, network, or bpftool)
 build/build.sh              container build + netns rehearsal + spec + yaml
-build/suricata-stock.yaml   stock 8.0.6 yaml kept for drift comparison
-deploy/deploy.sh            file push + verify; enables nothing
+build/suricata-stock.yaml   stock yaml kept for drift comparison
+build/suricata-stock.version  the RPM NVR that stock yaml came from
+deploy/deploy.sh            file push + verify-before-install; enables nothing
 ```
 
 Real deployments keep their per-host config directories (interfaces,
@@ -55,10 +56,33 @@ docker run --rm --privileged -v "$PWD:/work" fedora:44 /bin/bash /work/build/bui
 ```
 
 Outputs land in `build/out/`: `nodeguard_kern.o`, `nodeguard-maps.spec`
-(generated from the object; the maps service refuses drift), and a
-`suricata.yaml` per host config dir (`HOSTS_DIR=` selects a private
-overlay). The rehearsal step attaches the object in a netns against
-pre-created pins and fails the build on any verifier or pin-reuse problem.
+(generated from the object; the maps service refuses drift),
+`nodeguard_kern.o.sha256` (compared by `deploy.sh`, not eyeballed),
+`nodeguard_kern.o.buildinfo`, and a `suricata.yaml` per host config dir
+(`HOSTS_DIR=` selects a private overlay). The rehearsal step attaches the
+object in a netns against pre-created pins and fails the build on any
+verifier or pin-reuse problem.
+
+### Pinning the builder image
+
+`fedora:44` is a floating tag, so the command above records nothing about
+what compiled the object. Resolve the digest on the build host, pass it in,
+and run the image by digest:
+
+```
+IMAGE_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' fedora:44)"
+docker run --rm --privileged -v "$PWD:/work" -e IMAGE_DIGEST="$IMAGE_DIGEST" \
+    fedora@"${IMAGE_DIGEST#*@}" /bin/bash /work/build/build.sh
+```
+
+`build/out/nodeguard_kern.o.buildinfo` is the audit trail: build time, git
+commit, base image digest, `clang --version`, and the toolchain RPM NVRs,
+with `unknown` written for anything the container could not determine
+(`IMAGE_DIGEST` unset, no git metadata on the mount). Refresh the pin
+deliberately; the RPM NVRs remain the fallback provenance when the pin is
+skipped. This records **provenance, not reproducibility**: two builds of
+the same commit may produce different bytes, and the buildinfo file is what
+makes such a difference explainable.
 
 ## Deploy and bring-up
 

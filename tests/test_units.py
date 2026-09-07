@@ -46,6 +46,22 @@ READ_WRITE_PATHS = {
     "nodeguard-allow-refresh": set(),
 }
 
+# fix-nodeguard-deploy-reliability design.md section 1, per-unit
+# TimeoutStartSec. systemd defaults a Type=oneshot start timeout to
+# infinity, so an unbounded unit does not fail when it hangs: it stays
+# activating and its timer stops firing. The values are sized below each
+# unit's own timer period (boot-path units carry a bounded value instead).
+TIMEOUT_START_SEC = {
+    "nodeguard-watchdog": "55s",
+    "nodeguard-sweep": "8min",
+    "nodeguard-geo": "4min",
+    "nodeguard-feeds": "30min",
+    "suricata-update": "30min",
+    "nodeguard-maps": "2min",
+    "nodeguard-xdp": "2min",
+    "nodeguard-allow-refresh": "180",
+}
+
 # design.md section 2, per-unit CapabilityBoundingSet.
 CAPABILITIES = {
     "nodeguard-maps": {"CAP_SYS_ADMIN", "CAP_BPF", "CAP_NET_ADMIN"},
@@ -132,6 +148,15 @@ class CommonHardeningTest(unittest.TestCase):
                 self.assertIsNotNone(values)
                 self.assertEqual(len(values), 1)
                 self.assertIn(BASE_SYSCALL_SET, values[0].split())
+
+    def test_every_oneshot_unit_bounds_its_start(self):
+        for name, path in unit_files():
+            directives = service_directives(path)
+            if directives.get("Type") != ["oneshot"]:
+                continue
+            with self.subTest(unit=name):
+                self.assertEqual(directives.get("TimeoutStartSec"),
+                                 [TIMEOUT_START_SEC.get(name)])
 
     def test_every_service_unit_bounds_its_capabilities(self):
         for name, path in unit_files():

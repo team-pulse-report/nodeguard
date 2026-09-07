@@ -5,7 +5,9 @@ Every Type=oneshot unit SHALL carry an explicit TimeoutStartSec sized
 below its own timer period (or a bounded value for boot-path units), so
 a hung run lands the unit in the failed state instead of activating
 forever, and external tool invocations inside timer-driven scripts
-SHALL be individually time-bounded.
+SHALL be individually time-bounded, with each bound sized to fit inside
+the budget of the tightest unit that reaches the call rather than the
+loosest.
 
 #### Scenario: a hung watchdog cycle cannot halt failure detection
 - WHEN a watchdog cycle blocks on a wedged external tool

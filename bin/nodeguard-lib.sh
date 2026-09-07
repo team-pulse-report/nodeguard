@@ -8,6 +8,11 @@ NG_LIB=/usr/local/lib/nodeguard
 NG_OBJ="$NG_LIB/nodeguard_kern.o"
 NG_SPEC="$NG_LIB/nodeguard-maps.spec"
 NG_MAP="$NG_LIB/ngmap.py"
+# Bound on one external tool invocation (xdp-loader, tailscale). Every
+# caller runs inside a Type=oneshot unit whose start timeout is as low as
+# 55s (the watchdog), so one wedged tool has to fail its own step well
+# inside that budget instead of consuming the whole cycle.
+NG_TOOL_TIMEOUT=10
 
 # Log one message to both the system journal (tagged "nodeguard" at the
 # given syslog level, default info) and stderr, so every CLI and unit
@@ -41,7 +46,11 @@ ng_cfg_set() { python3 "$NG_MAP" set-config "$1" "$2"; }
 # nodeguard-detach, nodeguard-reload.
 ng_prog_ids() {
     local out rc
-    out=$(xdp-loader status "$IFACE" 2>&1)
+    # INVARIANT: the timeout preserves the three-valued contract rather
+    # than widening it - an expiry exits 124, which is a nonzero rc with a
+    # logged error, so a wedged loader reads as UNKNOWN and never as
+    # detached.
+    out=$(timeout "$NG_TOOL_TIMEOUT" xdp-loader status "$IFACE" 2>&1)
     rc=$?
     if [ "$rc" -ne 0 ]; then
         ng_log "xdp-loader status $IFACE failed (rc=$rc): $(printf '%s' "$out" | head -1)" err

@@ -484,7 +484,7 @@ node at every step.
 | False positive on a needed remote | Unreachable for at most one TTL | `nodeguard-unblock` over the always-open tailnet path; `ignore` the SID |
 | tailscaled restarts and moves its port | WireGuard pass stale for at most one minute | Watchdog rewrites `config[0]` |
 | Upstream/ISP outage | Watchdog soft-off at 5 strikes; hitless | One auto re-arm per boot after 15 clean cycles |
-| Watchdog itself dead | No latch protection; datapath unchanged | Timer unit alarm |
+| Watchdog itself dead or hung | No latch protection; datapath unchanged | A crash fails the unit and alarms; a HANG would leave the oneshot activating forever and stop the timer firing at all, so `TimeoutStartSec=55s` (`units/nodeguard-watchdog.service`) kills the cycle inside its own period and turns the hang into the same failed unit the alarms already see |
 | First attach / final detach on ixgbe | Multi-second link blip | Scheduled window; dead-man abort or self-recovering canary |
 | `firewall-cmd --reload`, docker reconcile | None (XDP is not nftables) | n/a |
 | Reboot | Maps empty; allowlist and config rebuilt at boot; blocks lost (accepted) | None needed |
@@ -500,7 +500,7 @@ On-host layout (installed by `deploy/deploy.sh`):
 
 | Path | Contents |
 |---|---|
-| `/usr/local/lib/nodeguard/` | `nodeguard_kern.o`, `nodeguard-maps.spec`, `ngmap.py`, `nodeguard-lib.sh` |
+| `/usr/local/lib/nodeguard/` | `nodeguard_kern.o`, `nodeguard_kern.o.sha256`, `nodeguard-maps.spec`, `ngmap.py`, `nodeguard-lib.sh`; `.prev` copies of the object and spec after a differing `--with-kernel` deploy |
 | `/usr/local/sbin/` | the `nodeguard-*` scripts; `block`/`unblock`/`list`/`flush`/`off`/`on` as symlinks to `nodeguard-cli` |
 | `/etc/nodeguard/` | `nodeguard.env`, `allow4.txt`, `allow6.txt`, `responder.conf`, `protected.conf`, `sids.conf` |
 | `/etc/systemd/system/` | units, timers, the per-host device drop-in, the Suricata limits drop-in |
@@ -765,9 +765,16 @@ One bullet per ADR; the rationale and evidence live in the ADRs under
   (block/list/config/sweep), unload by id (`build/build.sh:107`). The
   stdlib unit suite runs first (`build/build.sh:19`), so a control-plane
   regression fails the build before any compile or rehearsal time.
-- **Deploy-time verification**: `bash -n` on every script,
-  `py_compile` on the Python, `systemd-analyze verify` on every unit,
-  and a sha256 of the installed object (`deploy/deploy.sh`).
+- **Deploy-time verification**: `bash -n` on every script, `py_compile`
+  on the Python, `systemd-analyze verify` on every unit (the per-host
+  drop-in merged in), `suricata -T` on the generated config from phase 1
+  onward (it needs the ruleset `suricata-update` writes, so a phase-0
+  host is told the config is unvalidated instead of being refused), and
+  the object's sha256 compared against the hash the build recorded, all
+  against the STAGED copies before the first install command, so a
+  verification failure leaves the host byte-identical to before the run
+  (`deploy/deploy.sh`). The unit set verified and the unit set installed
+  come from one glob expansion, so they cannot diverge.
 - **Runtime self-verification**: attach refuses on map-identity
   divergence; maps service refuses on spec drift or a canary-covering
   allow entry; the responder refuses to start with empty `HOME_NETS`

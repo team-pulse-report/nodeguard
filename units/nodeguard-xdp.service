@@ -9,6 +9,11 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/nodeguard-attach
 ExecStop=/usr/local/sbin/nodeguard-detach
+# NOTE: Type=oneshot defaults to an infinite start timeout. Boot-path
+# unit; the slowest legitimate attach is the ixgbe link blip plus the
+# map-identity check, so 2min bounds a wedged loader without racing a
+# healthy attach.
+TimeoutStartSec=2min
 # Hardening (evaluation finding S2). ProtectSystem=strict leaves /dev,
 # /proc, and /sys writable, so the bpffs pin directory keeps working; it
 # is listed anyway as documentation and against a semantics change.

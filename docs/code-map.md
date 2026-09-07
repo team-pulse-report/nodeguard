@@ -185,8 +185,10 @@ extractor for the watchdog's embedded detector, and the fakes for every
 subprocess and transport boundary) plus `test_ngmap.py`,
 `test_feeds.py`, `test_responder.py`, and `test_watchdog_anom.py`, and
 the confinement-and-containment modules `test_units.py` (every shipped
-unit against the documented hardening tables), `test_geo_write.py`,
-`test_feeds_fetch.py`, and `test_responder_journal.py`.
+unit against the documented hardening tables and its oneshot start
+timeout), `test_geo_write.py`, `test_feeds_fetch.py`,
+`test_responder_journal.py`, and `test_mkyaml.py` (the generated
+suricata.yaml header's stock-version sidecar).
 Hermetic by invariant: no root, no network, no bpftool, and no write
 outside a temporary directory, so it runs on any machine with python3.
 `deploy.sh` ships an explicit manifest, so the suite never reaches a

@@ -20,9 +20,12 @@ if [ "$(stat -c%s "$tmp")" -lt 5000000 ] || ! gzip -t "$tmp" 2>/dev/null; then
 fi
 # Preprocess into two files: starts (array of u32 range starts, for
 # bisect) and recs (14-byte packed records in the same order). IPv4 only.
-python3 - "$tmp" "$SHARE" <<'PYEOF'
+python3 - "$tmp" "$SHARE" "$MONTH" <<'PYEOF'
 import csv, gzip, ipaddress, struct, sys, array, os
-src, share = sys.argv[1], sys.argv[2]
+# The heredoc is quoted, so the month has to arrive as an argument like
+# the other two parameters; interpolating it into the summary string is
+# what raised NameError on every otherwise successful run.
+src, share, month = sys.argv[1], sys.argv[2], sys.argv[3]
 starts = array.array("I")
 recs = open(os.path.join(share, "dbip.recs.tmp"), "wb")
 n = 0
@@ -50,7 +53,7 @@ os.replace(os.path.join(share, "dbip.recs.tmp"),
            os.path.join(share, "dbip.recs"))
 os.replace(os.path.join(share, "dbip.starts.tmp"),
            os.path.join(share, "dbip.starts"))
-print(f"geoip index built: {n} ranges ({MONTH})".replace("{MONTH}", os.environ.get("MONTH","")))
+print(f"geoip index built: {n} ranges ({month})")
 PYEOF
 rm -f "$tmp" "$SHARE/dbip.csv.gz"
 echo "geoip index ready in $SHARE (dbip.starts + dbip.recs)"

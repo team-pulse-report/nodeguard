@@ -59,6 +59,20 @@ nonzero rc with a logged error, which callers already treat as state
 UNKNOWN. bin/nodeguard-lib.sh joins the affected-code list for this
 reason.
 
+The bpftool bound in bin/ngmap.py cannot be one number, because the same
+file serves the sweep (8min budget, whole-map dumps) and the watchdog
+cycle (55s budget, many calls in a row: three ng_cfg_get reads of its
+own plus the three reads and two dumps nodeguard-status --kv makes).
+Sized for the loose consumer it rides the tight unit's timeout on the
+second wedged call; sized for the tight one it fails a slow but working
+dump. The default therefore stays 30s and ngmap.py reads an
+NG_BPFTOOL_TIMEOUT override, which bin/nodeguard-watchdog exports as
+NG_TOOL_TIMEOUT (10s, the shell-side bound) so every ngmap child it
+spawns, directly or through nodeguard-status, inherits the tight value
+from the one definition in bin/nodeguard-lib.sh. An unusable override
+falls back to the default rather than raising, since the read happens at
+import and a typo must not take every map operation on the host down.
+
 Documentation correction (refuter, carried with R1): the failure-mode
 table row at docs/design.md:482 reads "Watchdog itself dead | No latch
 protection; datapath unchanged | Timer unit alarm". For a crashed
@@ -196,7 +210,15 @@ Decision: record provenance, do not claim reproducibility.
    object: clang --version, rpm -q NVRs for clang llvm libbpf-devel
    libxdp-devel xdp-tools bpftool kernel-headers, the repo git commit
    (git -C /work rev-parse HEAD, recorded as unknown if the mount has
-   no .git), the base image digest from the IMAGE_DIGEST environment
+   no .git). Two things have to be arranged for that field to ever hold
+   a commit, and without them it reads unknown on every build rather
+   than only on a .git-less mount: the fedora:44 base image ships no
+   git, so build.sh installs it (outside TOOLCHAIN_PKGS, since git does
+   not reach the object), and /work is a bind mount owned by the host
+   uid while the container runs as root, so git rejects the checkout as
+   dubious ownership until the path is registered in safe.directory.
+   The buildinfo also carries the base image digest from the
+   IMAGE_DIGEST environment
    variable passed by the runner (recorded as unknown when unset; the
    digest is not discoverable from inside a plain docker run, so the
    host must resolve and pass it), and the build UTC timestamp.
@@ -246,22 +268,58 @@ Decision:
    would silently check against the OLD installed binaries rather
    than the staged ones. The verify step therefore filters
    executable-existence diagnostics for exactly those ExecStart and
-   ExecStop paths whose basenames are present in the staging
-   directory: those executables are syntax-verified separately (bash
-   -n, py_compile, also pre-install) and are installed by this same
-   run, so their absence or staleness on disk is not a defect of the
-   staged unit. Diagnostics for any other path, and all non-existence
+   ExecStop paths that this run installs: the path must sit under one
+   of the two destinations the install loop writes to
+   (/usr/local/sbin or /usr/local/lib/nodeguard) AND its basename must
+   be present in the staging directory. Those executables are
+   syntax-verified separately (bash -n, py_compile, also pre-install)
+   and are installed by this same run, so their absence or staleness on
+   disk is not a defect of the staged unit. The destination test is not
+   redundant with the basename test: a unit whose ExecStart named
+   /usr/bin/nodeguard-geo, a path no run installs, would otherwise be
+   filtered by the staged file of the same name and its 203/EXEC
+   shipped silently, which is the exact failure this change exists to
+   stop. Diagnostics for any other path, and all non-existence
    diagnostics, still fail verification. This keeps both properties:
    the bootstrap deploy passes, and no install command runs before
    verification completes, so a failure still leaves the host
    untouched.
+
+   The per-host drop-in is verified with the unit it modifies. Before
+   the loop, the staged flat nodeguard-xdp-10-device.conf is copied to
+   "$S"/nodeguard-xdp.service.d/10-device.conf and installed from
+   there, because systemd merges drop-ins from a <unit>.d directory
+   beside the unit file and merges nothing into a flat neighbour. The
+   old post-install loop verified /etc/systemd/system/<unit>, where the
+   installed drop-in was already merged; without this the one fragment
+   that changes per host (it carries the Wants= and After= on the
+   interface's .device unit) would become the only unit fragment
+   nothing verifies. The copy rearranges the staging directory only and
+   the "$S"/*.service glob does not match the .d directory, so the
+   shared unit list is unchanged.
 2. suricata -T runs as suricata -T -c "$S/suricata.yaml" with the
    host's rule paths; its nonzero exit sets verify_fail like the
-   existing checks.
-3. nodeguard-maps.spec rotates to .prev under the same
-   only-when-different guard the object uses
-   (deploy/deploy.sh:85-88), keeping the pair consistent: rollback
-   restores object and spec together.
+   existing checks, but ONLY when the host has a ruleset. suricata -T
+   forces engine.init-failure-fatal, and the generated yaml carries
+   default-rule-path /var/lib/suricata/rules with rule-files
+   suricata.rules, a file no suricata RPM creates: it appears when
+   suricata-update first runs, which is phase 1 (docs/design.md
+   section 6.4), one phase AFTER the deploy. An unconditional gate
+   therefore aborts every phase-0 bootstrap with exit 4 and installs
+   nothing, defeating the flow item 1 above is written to preserve. The
+   ruleset gates the check instead: absent, the deploy prints that the
+   staged yaml is UNVALIDATED and why, and proceeds. A skipped
+   validation is reported as unknown, never as a pass.
+3. nodeguard-maps.spec rotates to .prev together with the object, under
+   one only-when-different decision taken over the pair rather than a
+   guard per artifact (deploy/deploy.sh:85-88 held the object's). A
+   per-artifact guard rotates whichever file changed and leaves the
+   other at an older generation, so a deploy that changes only the
+   object followed by one that changes only the spec (which the spec
+   generator changing produces) leaves a straddled .prev pair that the
+   spec-object pairing check then refuses: a blocked rollback, arrived
+   at through the mechanism meant to enable it. One decision, both
+   files, so rollback restores a pair that actually coexisted.
 
 ## 7. install-geoip NameError (B4) and stock drift (B5)
 

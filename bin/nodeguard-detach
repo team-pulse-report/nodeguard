@@ -13,6 +13,15 @@ fi
 # dispatcher's own listing is authoritative and also covers a duplicate
 # member.
 live=$(ng_prog_ids)
+probe_rc=$?
+# SAFETY: an unreadable dispatcher is UNKNOWN, never "nothing to detach".
+# Collapsing the two reports a clean detach while the program may still be
+# attached and dropping (the dangerous direction here), and deleting the
+# run files would destroy the ng.prog_match evidence with it.
+if [ "$probe_rc" -ne 0 ]; then
+    ng_log "attach state UNKNOWN, refusing to report clean detach" crit
+    exit 1
+fi
 ids=$(printf '%s\n%s\n' "$ids" "$live" | sort -un | grep -v '^$' || true)
 
 if [ -z "$ids" ]; then
@@ -26,8 +35,17 @@ for id in $ids; do
     if xdp-loader unload "$IFACE" -i "$id" 2>/dev/null; then
         ng_log "unloaded nodeguard prog id $id from $IFACE"
     else
-        # SAFETY: only fail if the id is still live in the dispatcher.
-        if ng_prog_ids | grep -qx "$id"; then
+        # SAFETY: only fail if the id is still live in the dispatcher, and
+        # read the recheck's rc BEFORE grepping its output: piping it
+        # straight into grep makes a failed listing (no output) look
+        # exactly like a successful unload, so a broken loader would read
+        # as a clean detach.
+        recheck=$(ng_prog_ids)
+        probe_rc=$?
+        if [ "$probe_rc" -ne 0 ]; then
+            ng_log "attach state UNKNOWN, refusing to report clean detach" crit
+            rc=1
+        elif printf '%s\n' "$recheck" | grep -qx "$id"; then
             ng_log "failed to unload prog id $id from $IFACE" err
             rc=1
         fi

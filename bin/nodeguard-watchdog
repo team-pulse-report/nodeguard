@@ -9,6 +9,14 @@ set -uo pipefail
 ng_env
 mkdir -p "$NG_RUN"
 
+# One cycle makes many map calls (three config reads here, plus the reads
+# nodeguard-status --kv makes below), and ngmap.py's own default bound is
+# sized for the whole-map dumps the sweep and geo units do under budgets
+# of minutes. Inside this unit's 55s budget that default is too loose, so
+# the cycle exports the shell-side bound to every ngmap child it spawns,
+# directly or through nodeguard-status.
+export NG_BPFTOOL_TIMEOUT="$NG_TOOL_TIMEOUT"
+
 # Export the status snapshot for the monitoring agent. SELinux keeps
 # zabbix_agent_t from making bpf() syscalls (sudo does not change the
 # domain), so the agent reads this file instead of running the tools.
@@ -269,7 +277,11 @@ PYEOF
 # Lifeline probe: tailscaled reports this node as Online in its own
 # status. Confirms the management overlay is up, not just the local link.
 probe_tailscale() {
-    tailscale status --json 2>/dev/null | python3 -c '
+    # A wedged tailscaled is a known event on these hosts, and an untimed
+    # status call inside a one-minute cycle is how one hang became a
+    # stalled timer; the expiry reads as a failed lifeline, which is the
+    # conservative direction.
+    timeout "$NG_TOOL_TIMEOUT" tailscale status --json 2>/dev/null | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 sys.exit(0 if d.get("Self", {}).get("Online") else 1)

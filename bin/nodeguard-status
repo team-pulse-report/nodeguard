@@ -40,7 +40,10 @@ fi
 
 attach_mode=none
 if [ "$attached" -eq 1 ]; then
-    attach_mode=$(xdp-loader status "$IFACE" 2>/dev/null \
+    # Bounded: the --kv path runs every minute inside the watchdog's
+    # 55s unit budget, and an unreadable mode is reported as unknown
+    # below rather than being allowed to hang the cycle.
+    attach_mode=$(timeout "$NG_TOOL_TIMEOUT" xdp-loader status "$IFACE" 2>/dev/null \
         | awk '$2 == "xdp_dispatcher" { print $3; exit }')
     [ -n "$attach_mode" ] || attach_mode=unknown
 fi
@@ -245,5 +248,5 @@ if [ -s "$MAPSTAT" ]; then
 fi
 if [ "$attached" -eq 1 ]; then
     echo "-- dispatcher --"
-    xdp-loader status "$IFACE" | sed 's/^/  /'
+    timeout "$NG_TOOL_TIMEOUT" xdp-loader status "$IFACE" | sed 's/^/  /'
 fi
