@@ -436,12 +436,24 @@ class Runner:
                             hdrs["last_modified"]).timestamp())
                 except (TypeError, ValueError):
                     pass
+        # Per feed, defaulting to the global. This clock measures how long
+        # the publisher has gone without changing the list, not whether it
+        # is reachable: a fetch that errors has already failed the feed
+        # above and never arrives here. Publication cadence differs by
+        # orders of magnitude between feeds, so one global threshold fires
+        # on the ordinary behaviour of the slowest one. spamhaus_drop_v6
+        # changes every 21.5 days on average (measured 2019 to 2024), so a
+        # 14-day global is below its mean interval and failed it on 37
+        # percent of intervals while the data was current and the publisher
+        # alive. Same override convention as FEEDS_MIN_/FEEDS_MAX_ and
+        # FEEDS_MAX_CHURN_PCT_ above.
+        stale_s = int(self.conf.get(f"FEEDS_MAX_STALE_S_{feed.upper()}",
+                                    self.conf["FEEDS_MAX_STALE_S"]))
         if meta.get("last_changed_ts") and \
-                self.now - meta["last_changed_ts"] > \
-                int(self.conf["FEEDS_MAX_STALE_S"]):
+                self.now - meta["last_changed_ts"] > stale_s:
             self.failed.append(feed)
             self.dline(f"FAILED {feed}: upstream frozen past "
-                       f"{self.conf['FEEDS_MAX_STALE_S']}s; entries decay")
+                       f"{stale_s}s; entries decay")
             return None
         meta.setdefault("last_changed_ts", self.now)
 

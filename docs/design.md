@@ -674,6 +674,7 @@ staleness of the whole chain is one `fuzzytime` check.
 | `feeds.conf` | `FEEDS_MAX_COVERAGE_V6_48` | `46137344` | Aggregate v6 coverage cap in /48 equivalents; exceeding it aborts the run |
 | `feeds.conf` | `FEEDS_MAX_CHURN_PCT` | `30` | Composition churn brake; a larger swing is held for operator review |
 | `feeds.conf` | `FEEDS_MAX_STALE_S` | `1209600` | Upstream snapshot staleness cap (14 days); a staler feed fails and its entries decay |
+| `feeds.conf` | `FEEDS_MAX_STALE_S_<FEED_ID>` | unset | Per-feed staleness cap overriding the global; set where a publisher's measured cadence exceeds it, for example `7776000` (90 days) for `spamhaus_drop_v6` |
 | `nodeguard.env` | `WD_ANOM_MODE` / `WD_ANOM_K` / `WD_ANOM_FLOOR` / `WD_ANOM_TRIP` / `WD_ANOM_ADAPT` | `shadow` / `8` / `500` / `3` / `30` | Anomaly-detector tunables (`bin/nodeguard-watchdog:35`): mode `off`/`shadow`/`on` (shadow logs and exports `ng.anomaly_shadow_count` while `anomaly_count` stays 0), deviation multiplier, per-cycle absolute floor, consecutive-cycle trip count, per-metric bounded skip streak |
 | build-time | `NG_TTL_LOW_FLOOR` | `5` | TTL-outlier counting floor for the stats2 `ttl_low` counter (`src/nodeguard_kern.c:39`); telemetry threshold only, never a verdict input |
 
@@ -926,3 +927,16 @@ host. Rejected with reasons in the survey: XDPeek (dispatcher-incompatible,
 redundant), nDPI (no gap versus Suricata here), XDP synproxy and
 connection-limit tracking (no stateful listener to defend), XDP-level
 sampling (redundant with the af-packet capture path).
+
+Also deferred, from OpenSpec change `scope-the-frozen-upstream-brake-per-feed`
+(2026-09-20): replace the frozen-upstream brake's content-digest clock with the
+publisher's own metadata timestamp. Both Spamhaus DROP bodies end with a
+metadata record whose `timestamp` advances on every regeneration even when the
+entry list is byte identical; on 2026-09-20 `drop_v6` served a timestamp 16 days
+newer than its last content change. That field asks the question the brake
+actually means to ask, whether the publisher is still running, and would let the
+threshold be short again instead of tuned per feed. It is deferred because it is
+a different signal with its own blind spots: a publisher that stamps but stops
+curating would read as healthy, and `dshield_top20` carries no such field, so it
+needs its own proposal and tests rather than riding along with a threshold
+change.
