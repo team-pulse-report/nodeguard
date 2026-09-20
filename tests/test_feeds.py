@@ -5,6 +5,7 @@ driven with hostile and truncated bodies, the run-level containment that
 keeps one bad body from killing the run (evaluation finding S4), and the
 feed gates."""
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -566,3 +567,108 @@ class ReconcilePlanTest(RunnerFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrozenUpstreamBrakeTest(RunnerFixture):
+    """The frozen-upstream brake and its per-feed threshold. This clock
+    measures how long a publisher has gone without changing its list, not
+    whether it is reachable: an unreachable feed fails on fetch and never
+    reaches here. Publication cadence differs by orders of magnitude between
+    feeds, so one global threshold fires on the ordinary behaviour of the
+    slowest one."""
+
+    DAY = 86400.0
+
+    def frozen_runner(self, age_days, **conf):
+        """A Runner whose SPAMHAUS feed last changed age_days ago. The digest
+        is pre-seeded to the served body so the fetch does not reset the
+        clock, which is exactly what a publisher serving an unchanged list
+        looks like."""
+        self.serve()
+        with ngtest.captured_log():
+            runner = feeds.Runner(self.conf(**conf))
+        body = self.responses[SPAMHAUS][1]
+        meta = runner.feed_meta(SPAMHAUS)
+        meta["last_digest"] = hashlib.sha256(body).hexdigest()
+        meta["last_changed_ts"] = runner.now - age_days * self.DAY
+        return runner
+
+    def test_a_feed_past_the_global_default_fails(self):
+        """The existing brake, which had no test before this change."""
+        runner = self.frozen_runner(20)
+        with ngtest.captured_log():
+            self.assertIsNone(runner.obtain(SPAMHAUS))
+        self.assertIn(SPAMHAUS, runner.failed)
+        self.assertIn("upstream frozen", "\n".join(runner.diff_lines))
+
+    def test_a_feed_inside_the_global_default_survives(self):
+        runner = self.frozen_runner(10)
+        with ngtest.captured_log():
+            self.assertIsNotNone(runner.obtain(SPAMHAUS))
+        self.assertNotIn(SPAMHAUS, runner.failed)
+
+    def test_per_feed_override_lets_a_slow_publisher_through(self):
+        """spamhaus_drop_v6 changes every 21.5 days on average, so the 14-day
+        global fails it on 37 percent of its intervals with current data and a
+        live publisher. A feed given a threshold matching its measured cadence
+        must not be failed where the global default fails it."""
+        default_run = self.frozen_runner(20)
+        with ngtest.captured_log():
+            default_run.obtain(SPAMHAUS)
+        self.assertIn(SPAMHAUS, default_run.failed)
+
+        tuned = self.frozen_runner(
+            20, **{f"FEEDS_MAX_STALE_S_{SPAMHAUS.upper()}": "7776000"})
+        with ngtest.captured_log():
+            self.assertIsNotNone(tuned.obtain(SPAMHAUS))
+        self.assertNotIn(SPAMHAUS, tuned.failed)
+
+    def test_absent_override_still_uses_the_global_default(self):
+        """No override means the old behaviour, unchanged."""
+        runner = self.frozen_runner(15, FEEDS_MAX_STALE_S="1209600")
+        with ngtest.captured_log():
+            runner.obtain(SPAMHAUS)
+        self.assertIn(SPAMHAUS, runner.failed)
+
+    def test_override_applies_only_to_its_own_feed(self):
+        """A threshold on one feed must not raise another feed's."""
+        runner = self.frozen_runner(
+            20, **{f"FEEDS_MAX_STALE_S_{DSHIELD.upper()}": "7776000"})
+        with ngtest.captured_log():
+            runner.obtain(SPAMHAUS)
+        self.assertIn(SPAMHAUS, runner.failed)
+
+    def test_a_tuned_feed_that_goes_dark_still_fails(self):
+        """Raising a threshold defers the brake; it does not remove it."""
+        runner = self.frozen_runner(
+            40, **{f"FEEDS_MAX_STALE_S_{SPAMHAUS.upper()}": "2592000"})
+        with ngtest.captured_log():
+            runner.obtain(SPAMHAUS)
+        self.assertIn(SPAMHAUS, runner.failed)
+
+    def test_failed_record_names_the_applied_threshold(self):
+        """An operator must be able to tell a tuned feed that has genuinely
+        gone dark from one that was never tuned."""
+        runner = self.frozen_runner(
+            40, **{f"FEEDS_MAX_STALE_S_{SPAMHAUS.upper()}": "2592000"})
+        with ngtest.captured_log():
+            runner.obtain(SPAMHAUS)
+        self.assertIn("frozen past 2592000s", "\n".join(runner.diff_lines))
+
+    def test_a_frozen_feed_does_not_fail_its_peers(self):
+        """The unit fails as a whole, so a feed stuck on a benign freeze must
+        not be able to mask a real failure of another feed."""
+        runner = self.frozen_runner(20)
+        with ngtest.captured_log():
+            runner.obtain(SPAMHAUS)
+            self.assertIsNotNone(runner.obtain(DSHIELD))
+        self.assertIn(SPAMHAUS, runner.failed)
+        self.assertNotIn(DSHIELD, runner.failed)
+
+    def test_malformed_override_fails_the_run(self):
+        """A typo must not silently fall back to the default."""
+        runner = self.frozen_runner(
+            20, **{f"FEEDS_MAX_STALE_S_{SPAMHAUS.upper()}": "ninety"})
+        with self.assertRaises(ValueError):
+            with ngtest.captured_log():
+                runner.obtain(SPAMHAUS)
