@@ -23,6 +23,9 @@ Contract:
 - 72-column grid helpers and the Okabe-Ito palette. host_color() hashes the
   host name into the palette so a host keeps its color when the fleet grows
   or the member list reorders.
+- Legibility budgets (HEADER_*, *_SIZE below) are measured against the live
+  frontend, never taken from the documentation, because the API validates
+  neither field names nor widget types: see the note above the constants.
 
 Stdlib only. No mutation happens in this module beyond api() POSTs the
 caller explicitly issues.
@@ -57,6 +60,150 @@ OKABE_ITO = [
     "F0E442",  # yellow
     "999999",  # grey
 ]
+
+# Threshold colors shared by the tile, gauge, and honeycomb rules.
+GREEN = "81C784"
+AMBER = "FFB74D"
+RED = "E57373"
+# Tiles whose item is textual cannot carry a threshold colour. They get
+# this neutral wash instead, so that once every numeric tile is coloured a
+# plain white tile means "no data" and nothing else.
+NEUTRAL = "ECEFF1"
+
+# --- Legibility budgets ---------------------------------------------------
+#
+# Every number in this block was measured against the live 7.4.14 frontend
+# on 2026-09-20 by rendering a candidate widget beside the incumbent, NOT
+# read off the documentation. That is deliberate. The dashboard API
+# validates widget geometry and nothing else: dashboard.create accepted a
+# deliberately misspelled field name, an out-of-range enum, and a widget of
+# type "notawidget" without complaint. A widget that writes cleanly is not
+# a widget that renders, so "the API took it" is not evidence here and a
+# change to these numbers has to be re-checked by looking at the page.
+#
+# Widget headers are a fixed 14px bold Arial, ellipsized rather than
+# wrapped. Usable header width is the widget's pixel width minus a 72px
+# button gutter, and at the measured 1396px grid one column is 19.4px:
+#
+#     width 10 -> 194px ->  122px usable -> ~15 characters
+#     width 12 -> 233px ->  161px usable -> ~20 characters
+#     width 18 -> 349px ->  277px usable -> ~35 characters
+#     width 24 -> 465px ->  393px usable -> ~49 characters
+#
+# "gateway-office: " is 16 characters on its own. Prefixing a tile header
+# with the host name therefore spent the whole budget of a width-10 tile
+# before the metric was named, which is why every tile on the live Capacity
+# board read "<host>: ...". Host identity belongs in the widget's own
+# description field, which has the full tile width to itself.
+HEADER_GUTTER_PX = 72
+GRID_PX = 1396.0
+COLUMN_PX = GRID_PX / GRID_COLUMNS
+HEADER_CHAR_PX = 8.0
+
+# The item *_size fields are a percentage the frontend rescales by widget
+# height, so one size does not travel between tile heights, and the value
+# font is ellipsized rather than shrunk to fit, so one size does not travel
+# between short and long values either. Left at the Zabbix default of 45, a
+# width-10 tile clipped "attached" to "atta..." and a width-18 tile clipped
+# a timestamp to "2026-09-20 0...". Pinning a small size instead wastes the
+# tile: at the size that fits a 35-character ranked line, a 13-character
+# country line rendered at a fifth of the room it had.
+#
+# value_size_for() therefore computes the size from the string the item
+# actually holds. Its two calibration constants were measured on the live
+# frontend on 2026-09-20 by reading back the rendered font size:
+#
+#   height 2 tile,  value_size 45 -> 30.39px  => 0.675 px per size unit
+#   height 3 tile,  value_size 45 -> 58.03px  => 1.290 px per size unit
+#   height 5 gauge, desc_size  13 -> 30.37px  => 2.336 px per size unit
+#
+# The scale is roughly linear in pixel height but not exactly, so each
+# height the boards use is measured rather than interpolated, and a height
+# that has not been measured falls back to the Zabbix default instead of
+# being guessed at.
+#
+# and the usable value width is the tile's pixel width less 40px of
+# padding (349px width-18 tile measured 309px usable).
+VALUE_PX_PER_SIZE = {2: 0.675, 3: 1.290, 5: 2.336}
+VALUE_PADDING_PX = 40
+# Mean glyph width as a fraction of font size. Lowercase prose is the wide
+# case and digits, dots and slashes the narrow one; the wide figure is used
+# for both so a value that grows a little does not start clipping. Checked
+# against the two measured extremes: "attached" at width 10 clips at size
+# 30 and fits at 22, and a 35-character ranked line at width 18 clips at 45
+# and fits at 14.
+VALUE_CHAR_RATIO = 0.62
+VALUE_SAFETY = 0.9
+VALUE_SIZE_MAX = 45      # the Zabbix default; nothing needs to shout louder
+VALUE_SIZE_MIN = 8       # below this the tile is not worth rendering
+# A value can grow after the dashboard is built (a longer CIDR, a bigger
+# counter), so size for a string a fifth longer than the one on hand.
+VALUE_GROWTH = 1.2
+VALUE_CHARS_FALLBACK = 12   # when no sample value is available
+
+DESC_SIZE = 13           # height 3 host-name line: renders 17px
+DESC_TARGET_PX = 17      # the host line should read the same on every tile
+DESC_SIZE_MIN = 5
+
+
+def desc_size_for(chars, width, height):
+    """Size for a tile's host line: one apparent size on every widget.
+
+    The size fields scale with widget height, so the 13 that renders a
+    17px host line on a height-3 tile renders a 30px one on a height-5
+    gauge, where it swamped the dial. Target the pixel height instead and
+    clamp it to what the width will hold.
+    """
+    px_per_size = VALUE_PX_PER_SIZE.get(height)
+    if px_per_size is None:
+        return DESC_SIZE
+    usable = max(1.0, width * COLUMN_PX - VALUE_PADDING_PX)
+    fits_px = usable / (max(1.0, chars) * VALUE_CHAR_RATIO) * VALUE_SAFETY
+    return max(DESC_SIZE_MIN,
+               int(min(DESC_TARGET_PX, fits_px) / px_per_size))
+
+
+def value_size_for(chars, width, height):
+    """Largest value font size that shows `chars` characters unclipped.
+
+    chars is the length of the widest string the item is expected to hold,
+    width and height are the widget's grid dimensions. Returns a size in
+    the 1-100 units the item widget's value_size field takes.
+    """
+    px_per_size = VALUE_PX_PER_SIZE.get(height)
+    if px_per_size is None:
+        # Sizes were only calibrated at the two tile heights the boards
+        # use; anything else falls back to the Zabbix default rather than
+        # guessing, so a new tile shape is visibly ordinary, not subtly
+        # mis-sized.
+        return None
+    usable = max(1.0, width * COLUMN_PX - VALUE_PADDING_PX)
+    chars = max(1.0, chars * VALUE_GROWTH)
+    font_px = usable / (chars * VALUE_CHAR_RATIO)
+    size = int(font_px / px_per_size * VALUE_SAFETY)
+    return max(VALUE_SIZE_MIN, min(VALUE_SIZE_MAX, size))
+
+
+# Sparkline enable. The sparkline is turned on by listing it among the
+# widget's shown elements (show.N = 5); "sparkline.show" is not a field.
+# Setting only the latter, as this module did until 2026-09-20, is accepted
+# by the API and draws nothing.
+SHOW_DESCRIPTION = 1
+SHOW_VALUE = 2
+SHOW_TIME = 3
+SHOW_CHANGE = 4
+SHOW_SPARKLINE = 5
+
+
+def header_chars(width):
+    """How many header characters a widget of this column width shows.
+
+    Used by the generator's plan output to flag a header that will be
+    ellipsized, so the truncation is caught before it is applied rather
+    than noticed on the dashboard.
+    """
+    usable = width * COLUMN_PX - HEADER_GUTTER_PX
+    return max(0, int(usable / HEADER_CHAR_PX))
 
 
 class ZabbixError(Exception):
@@ -181,15 +328,42 @@ def resolve_group(api, group_name):
     return gid, hosts
 
 
-def resolve_itemids(api, hostid):
-    """All nodeguard item keys on one host, as {key: itemid}."""
+def resolve_items(api, hostid):
+    """All nodeguard items on one host, as {key: {itemid, value_type, units}}.
+
+    The value type decides how a tile renders: an unsigned counter wants no
+    decimal places, a text item wants a smaller value font than a number so
+    it is not clipped, and a unixtime item renders as a full datetime that
+    needs a wide tile. Resolving ids alone forced every tile to share one
+    presentation, which is how integer counters came to read "1691.00" in a
+    tile too narrow to show the "1691".
+    """
     out = {}
     for it in api.call("item.get", {
             "hostids": [hostid],
             "search": {"key_": "nodeguard."},
-            "output": ["itemid", "key_", "name"]}):
-        out[it["key_"]] = it["itemid"]
+            "output": ["itemid", "key_", "name", "value_type", "units",
+                       "lastvalue"]}):
+        out[it["key_"]] = {"itemid": it["itemid"],
+                           "value_type": int(it["value_type"]),
+                           "units": it.get("units", ""),
+                           "name": it["name"],
+                           "lastvalue": it.get("lastvalue", "")}
     return out
+
+
+# Zabbix item value types.
+VT_FLOAT = 0
+VT_CHAR = 1
+VT_LOG = 2
+VT_UNSIGNED = 3
+VT_TEXT = 4
+VT_NUMERIC = (VT_FLOAT, VT_UNSIGNED)
+
+
+def resolve_itemids(api, hostid):
+    """All nodeguard item keys on one host, as {key: itemid}."""
+    return {k: v["itemid"] for k, v in resolve_items(api, hostid).items()}
 
 
 def _f(ftype, name, value):
@@ -204,29 +378,73 @@ def widget(wtype, x, y, w, h, name="", fields=None):
             "width": w, "height": h, "fields": fields or []}
 
 
-def itemvalue(x, y, w, h, name, itemid, thresholds=(), sparkline=False):
-    """Single item value tile (widget type "item"). Optional numeric
-    thresholds color the displayed value (green under the first, then the
-    given colors); sparkline draws the recent trend behind the number so
-    a tile shows direction at a glance. thresholds is [(value, hex), ...]
-    and applies only to numeric items."""
-    fl = [_f(FIELD_ITEM, "itemid", itemid), _f(FIELD_INT, "show.0", 2)]
+def itemvalue(x, y, w, h, name, itemid, thresholds=(), sparkline=False,
+              description="", decimals=None, value_size=None,
+              desc_size=DESC_SIZE, sparkline_from="now-3h", bg_color=""):
+    """Single item value tile (widget type "item").
+
+    name is the widget header and carries the METRIC only. The host goes in
+    description, which gets the tile's full width; putting it in the header
+    instead spends the whole header budget before the metric is named (see
+    the legibility note above HEADER_GUTTER_PX).
+
+    thresholds is [(value, hex), ...] and colors the value at or above each
+    entry, leaving anything below the lowest entry uncolored; include an
+    entry at "0" so a healthy zero and a broken zero do not both render as
+    plain white. decimals sets decimal_places (0 for counters). value_size
+    must suit the tile height and the widest string the item can hold.
+    sparkline draws the recent trend behind the number.
+    """
+    fl = [_f(FIELD_ITEM, "itemid", itemid)]
+    shown = ([SHOW_DESCRIPTION] if description else []) + [SHOW_VALUE]
+    if sparkline:
+        shown.append(SHOW_SPARKLINE)
+    for i, what in enumerate(shown):
+        fl.append(_f(FIELD_INT, "show.%d" % i, what))
+    if description:
+        fl += [_f(FIELD_STR, "description", description),
+               _f(FIELD_INT, "desc_size", desc_size),
+               _f(FIELD_INT, "desc_v_pos", 0),
+               _f(FIELD_INT, "desc_h_pos", 1)]
+    if bg_color:
+        fl.append(_f(FIELD_STR, "bg_color", bg_color))
+    if decimals is not None:
+        fl.append(_f(FIELD_INT, "decimal_places", decimals))
+    if value_size is not None:
+        fl.append(_f(FIELD_INT, "value_size", value_size))
     for i, (val, color) in enumerate(thresholds):
         fl += [_f(FIELD_STR, "thresholds.%d.color" % i, color),
                _f(FIELD_STR, "thresholds.%d.threshold" % i, str(val))]
     if sparkline:
-        fl += [_f(FIELD_INT, "sparkline.show", 1),
-               _f(FIELD_STR, "sparkline.color", "3388CC"),
+        fl += [_f(FIELD_STR, "sparkline.color", "3388CC"),
                _f(FIELD_INT, "sparkline.time_period.from_type", 0),
-               _f(FIELD_STR, "sparkline.time_period.from", "now-3h")]
+               _f(FIELD_STR, "sparkline.time_period.from", sparkline_from)]
     return widget("item", x, y, w, h, name, fl)
 
 
-def gauge(x, y, w, h, name, itemid, vmin=0, vmax=100, thresholds=()):
-    """Gauge widget; thresholds is [(value, color_hex), ...]."""
+def gauge(x, y, w, h, name, itemid, vmin=0, vmax=100, thresholds=(),
+          description="", desc_size=DESC_SIZE, decimals=0, value_size=28):
+    """Gauge widget; thresholds is [(value, color_hex), ...].
+
+    description defaults in Zabbix to "{ITEM.NAME}", which renders the full
+    item name in oversized text under the dial and is clipped at any width
+    this dashboard uses; pass the host name instead, or "" for nothing. The
+    threshold arc and its labels are turned on because a dial whose needle
+    sits near zero otherwise says nothing about how far the value is from
+    the thresholds that matter.
+    """
     fl = [_f(FIELD_ITEM, "itemid", itemid),
           _f(FIELD_STR, "min", vmin),
-          _f(FIELD_STR, "max", vmax)]
+          _f(FIELD_STR, "max", vmax),
+          _f(FIELD_STR, "description", description),
+          _f(FIELD_INT, "desc_size", desc_size),
+          _f(FIELD_INT, "desc_v_pos", 0),
+          _f(FIELD_INT, "decimal_places", decimals),
+          _f(FIELD_INT, "value_size", value_size)]
+    if thresholds:
+        fl += [_f(FIELD_INT, "th_show_arc", 1),
+               _f(FIELD_INT, "th_arc_size", 12),
+               _f(FIELD_INT, "th_show_labels", 1)]
     for i, (val, color) in enumerate(thresholds):
         fl += [_f(FIELD_STR, "thresholds.%d.color" % i, color),
                _f(FIELD_STR, "thresholds.%d.threshold" % i, val)]
@@ -234,7 +452,7 @@ def gauge(x, y, w, h, name, itemid, vmin=0, vmax=100, thresholds=()):
 
 
 def svggraph(x, y, w, h, name, datasets, refseq, stacked=False,
-             legend_lines=2):
+             legend_lines=4, legend_columns=1):
     """SVG graph. datasets is [(host_patterns, item_patterns, color), ...].
 
     host_patterns and item_patterns may each be a string or a list; host
@@ -242,6 +460,12 @@ def svggraph(x, y, w, h, name, datasets, refseq, stacked=False,
     and items are addressed by display-NAME pattern per the template's
     display-name contract, so a rename would empty the graph (guarded by
     check_template.py).
+
+    The legend defaults to one column of variable height. Zabbix's own
+    default is four columns, which on a half-width graph gives each series
+    about 170px and rendered every entry as "<host>: nodegua..." -- four
+    indistinguishable series on the drop-rate graph, where telling v4 from
+    v6 and home from office is the entire point.
     """
     fl = [_f(FIELD_STR, "reference", next(refseq))]
     for i, (hosts, items, color) in enumerate(datasets):
@@ -254,7 +478,9 @@ def svggraph(x, y, w, h, name, datasets, refseq, stacked=False,
         fl.append(_f(FIELD_STR, "ds.%d.color" % i, color))
         if stacked:
             fl.append(_f(FIELD_INT, "ds.%d.stacked" % i, 1))
-    fl.append(_f(FIELD_INT, "legend_lines", legend_lines))
+    fl += [_f(FIELD_INT, "legend_lines", legend_lines),
+           _f(FIELD_INT, "legend_columns", legend_columns),
+           _f(FIELD_INT, "legend_lines_mode", 1)]
     return widget("svggraph", x, y, w, h, name, fl)
 
 
@@ -273,15 +499,38 @@ def pie(x, y, w, h, name, host_pattern, item_patterns):
     return widget("piechart", x, y, w, h, name, fl)
 
 
-def honeycomb(x, y, w, h, name, groupid, item_pattern, thresholds=()):
-    """Honeycomb addressed by host GROUP and item name pattern.
+def honeycomb(x, y, w, h, name, item_pattern, thresholds=(),
+              groupid=None, hostid=None, primary_label="{ITEM.NAME}",
+              primary_label_size=11, secondary_label_size=22):
+    """Honeycomb addressed by host GROUP or by one host, plus an item
+    name pattern. thresholds is [(value, color_hex), ...].
 
-    Group addressing means a new group member appears with no widget
-    rework. thresholds is [(value, color_hex), ...].
+    primary_label defaults to the ITEM name because the cells are the thing
+    being distinguished. Labelling them "{HOST.NAME}" instead, as this
+    module did until 2026-09-20, produced six cells reading "gateway-home"
+    and "gateway-office" over a per-feed age: three of them amber or red,
+    and no way to tell which feed had gone stale. Scope a honeycomb to one
+    host and put the host in the widget header to keep both facts.
+
+    Group addressing still means a new group member appears with no widget
+    rework; per-host honeycombs are generated from live group membership
+    and so cost no edit either.
     """
-    fl = [_f(FIELD_GROUP, "groupids.0", groupid),
-          _f(FIELD_STR, "items.0", item_pattern),
-          _f(FIELD_STR, "primary_label", "{HOST.NAME}")]
+    fl = [_f(FIELD_STR, "items.0", item_pattern),
+          _f(FIELD_INT, "primary_label_type", 0),
+          _f(FIELD_STR, "primary_label", primary_label),
+          _f(FIELD_INT, "primary_label_size_type", 1),
+          _f(FIELD_INT, "primary_label_size", primary_label_size),
+          _f(FIELD_INT, "secondary_label_type", 1),
+          _f(FIELD_INT, "secondary_label_size_type", 1),
+          _f(FIELD_INT, "secondary_label_size", secondary_label_size),
+          _f(FIELD_INT, "secondary_label_bold", 1)]
+    if hostid is not None:
+        fl.append(_f(FIELD_HOST, "hostids.0", hostid))
+    elif groupid is not None:
+        fl.append(_f(FIELD_GROUP, "groupids.0", groupid))
+    else:
+        raise ValueError("honeycomb needs a groupid or a hostid")
     for i, (val, color) in enumerate(thresholds):
         fl += [_f(FIELD_STR, "thresholds.%d.color" % i, color),
                _f(FIELD_STR, "thresholds.%d.threshold" % i, val)]
